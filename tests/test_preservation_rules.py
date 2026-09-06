@@ -64,6 +64,7 @@ class PreservationRuleTests(unittest.TestCase):
             "Buffer C/V",
             "Pick & Place",
             "2D CCD",
+            "PCW",
             "Check Sheet",
             "Spare Parts",
         ):
@@ -76,6 +77,7 @@ class PreservationRuleTests(unittest.TestCase):
             "Vertical stroke 300mm",
             "Wait to next step",
             "Pick up the Parts",
+            "Move to OK#1 Place Position",
             "The entered dimension information may be subject to change.",
             "Adjust the supporting structure.",
             "WAIT",

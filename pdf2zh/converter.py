@@ -61,7 +61,7 @@ TECHNICAL_ONLY_PATTERN = re.compile(
 COMMON_STANDALONE_TECHNICAL_TERM_PATTERN = re.compile(
     r"(?:PLC|HMI|Servo|Servo\s+Motor|Encoder|Interlock|JOG|Servo\s+ON|"
     r"SCARA\s+Robot|Linear\s+Motor|Buffer\s+C/V|Pick\s*&\s*Place|"
-    r"BCR|(?:2D\s+)?CCD|FFU|Utility|Check\s+Sheet|Spare\s+Parts|C/V)",
+    r"BCR|(?:2D\s+)?CCD|FFU|PCW|Utility|Check\s+Sheet|Spare\s+Parts|C/V)",
     re.IGNORECASE,
 )
 class TextStyle(IntEnum):

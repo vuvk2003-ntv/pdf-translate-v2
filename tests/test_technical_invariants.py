@@ -51,6 +51,14 @@ class TechnicalInvariantTests(unittest.TestCase):
             "Install IR-S10-80Z20S-INT at P[10].",
             "Lắp IR-S10-80Z30S-INT tại P[10].",
         )
+        self.assert_rejected(
+            "PCW Interlock 설정",
+            "Thiết lập Interlock",
+        )
+        self.assert_rejected(
+            "Move to OK#1 Place Position",
+            "Di chuyển đến vị trí đặt NG#1",
+        )
 
     def test_balanced_tags_may_move_but_must_keep_identity_and_nesting(self):
         validate_technical_invariants(

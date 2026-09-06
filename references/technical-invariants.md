@@ -10,6 +10,8 @@ paths, IPv4 addresses and protocol ports, PLC/robot variables, model/connector/
 alarm codes, standards and document identifiers, versions, numeric literals,
 engineering ranges and units, and literal `ON`/`OFF` states. Detection is
 deliberately conservative; it is a safety net, not a complete vendor grammar.
+The plant acronym `PCW` and indexed disposition positions such as `OK#1` and
+`NG#1` are treated as identifiers; ordinary uppercase prose is not.
 Executable PLC/robot instruction tokens are also immutable. Value/unit spacing
 is normalized for comparison, so `2350mm` and `2350 mm` are equivalent while a
 changed value, sign, or unit is rejected.

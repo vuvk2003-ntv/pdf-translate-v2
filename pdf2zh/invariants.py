@@ -50,6 +50,7 @@ TECHNICAL_IDENTIFIER_PATTERN = re.compile(
     r"[A-Z]{1,3}\[\d+\]|"
     r"(?:ZR|D|M|X|Y|R|P|Z|B|W|L|F|V)\d+|"
     r"(?:AL|ERR|ER|E)[.-]\d+|"
+    r"(?:OK|NG)#\d+|PCW|"
     r"(?:CN|COM)\d+|"
     r"(?=[A-Z0-9][A-Z0-9._/-]{3,})(?=[A-Z0-9._/-]*[A-Z])"
     r"(?=[A-Z0-9._/-]*\d)[A-Z0-9]+(?:[._/-][A-Z0-9]+)*"
