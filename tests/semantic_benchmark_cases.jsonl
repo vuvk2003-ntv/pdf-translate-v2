@@ -1,0 +1,7 @@
+{"id":"ko-sequence","source_language":"ko","source":"원점 복귀 완료 후 서보를 ON 하십시오.","invariants":["homing completed","AFTER/THEN relation","servo activation"]}
+{"id":"ko-prohibition","source_language":"ko","source":"안전 영역 내에서는 로봇을 자동 운전하지 마십시오.","invariants":["safety zone","robot","automatic operation","PROHIBITED"]}
+{"id":"ko-mandatory","source_language":"ko","source":"설비 가동 전에 반드시 안전 점검을 실시하여야 한다.","invariants":["safety inspection","BEFORE operation","MANDATORY"]}
+{"id":"en-sequence","source_language":"en","source":"Set D100 to 250 before enabling Servo ON.","invariants":["D100","250","BEFORE relation","servo activation"]}
+{"id":"zh-hans-mandatory","source_language":"zh-CN","source":"伺服开启前必须完成原点回归。","invariants":["homing","MANDATORY","BEFORE servo activation"]}
+{"id":"zh-hant-mandatory","source_language":"zh-TW","source":"伺服開啟前必須完成原點復歸。","invariants":["homing","MANDATORY","BEFORE servo activation"]}
+

@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+title: PDF Translate
+message: >-
+  Nếu bạn sử dụng phần mềm này, vui lòng ghi công theo thông tin dưới đây.
+type: software
+authors:
+  - given-names: Gia Huy
+    family-names: Lê Ngọc
+    alias: huyg.ai
+    website: 'https://www.tiktok.com/@huyg.ai'
+repository-code: 'https://github.com/breslee1707/VI-Translate'
+abstract: >-
+  Ứng dụng desktop mã nguồn mở dịch tài liệu PDF sang tiếng Việt và 35 ngôn ngữ
+  khác, giữ nguyên bố cục, công thức, bảng và hình ảnh. Ứng dụng, bộ quy tắc bảo
+  toàn bố cục và các bản sửa lỗi trong nhân xử lý PDF do Lê Ngọc Gia Huy
+  (huyg.ai) phát triển và duy trì, trên một nhân fork từ PDFMathTranslate.
+keywords:
+  - pdf
+  - translation
+  - vietnamese
+  - dịch pdf
+  - Lê Ngọc Gia Huy
+  - huyg.ai
+license: AGPL-3.0
