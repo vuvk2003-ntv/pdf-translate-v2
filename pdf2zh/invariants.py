@@ -7,6 +7,9 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 
+# Bump when classifier/validation semantics change; old cache entries stay on disk.
+TRANSLATION_RULES_VERSION = "code4life-translation-v2"
+
 
 @dataclass(frozen=True)
 class InvariantDifference:
@@ -94,6 +97,31 @@ EXECUTABLE_CODE_TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])(?:DFROM_M|DTO_M|MOV|BMOV|SET|RST|CASE|IF|THEN|"
     r"TON|MOVJ|MOVL|NWAIT)(?![A-Za-z0-9_])"
 )
+CODE_OPERAND = r"(?:0x[0-9A-Fa-f]+|[A-Z]{1,3}\[\d+\]|[A-Z]{1,3}\d+|[-+]?\d+(?:\.\d+)?)"
+CODE_STATEMENT_PATTERN = re.compile(
+    rf"(?<!\w)(?:(?:DFROM_M|DTO_M|MOV|BMOV|SET|RST|TON|MOVJ|MOVL)"
+    rf"(?:[ \t]+{CODE_OPERAND})+(?!\w)|NWAIT(?!\w))"
+)
+
+
+def is_executable_code_line(text: str) -> bool:
+    """Recognize supported code syntax, not an opcode-shaped English prefix."""
+    text = re.sub(r"^\s*\d+\s*[:)]\s*", "", text).strip()
+    if CODE_STATEMENT_PATTERN.fullmatch(text):
+        return True
+    conditional = re.fullmatch(r"IF\s+[A-Za-z_][\w.]*\s+THEN\s+(.+)", text)
+    return bool(conditional and CODE_STATEMENT_PATTERN.fullmatch(conditional[1]))
+
+
+def _executable_tokens(text: str) -> list[str]:
+    tokens = []
+    for line in text.splitlines():
+        if is_executable_code_line(line):
+            tokens.extend(_regex_tokens(EXECUTABLE_CODE_TOKEN_PATTERN, line))
+        else:
+            for match in CODE_STATEMENT_PATTERN.finditer(line):
+                tokens.extend(_regex_tokens(EXECUTABLE_CODE_TOKEN_PATTERN, match[0]))
+    return tokens
 PLACEHOLDER_PATTERN = re.compile(
     r"\{\{[^{}\r\n]+\}\}|\{[A-Za-z_][\w.-]*\}|"
     r"\$\{[A-Za-z_][\w.-]*\}|\$[A-Za-z_][\w.-]*|%(?:\d+|[sdif])"
@@ -192,14 +220,115 @@ TOKEN_CHECKS: tuple[tuple[str, Callable[[str], list[str]]], ...] = (
     ("ON/OFF polarity", lambda text: _regex_tokens(POLARITY_PATTERN, text)),
     (
         "executable code tokens",
-        lambda text: _regex_tokens(EXECUTABLE_CODE_TOKEN_PATTERN, text),
+        _executable_tokens,
     ),
 )
+
+_NAMED_OBJECT_PATTERN = re.compile(
+    r"\b(?:(?:axis|trục)\s+([XYZABC]|\d+)|([XYZABC])\s*(?:axis|축|轴|軸)|"
+    r"(?:parameter|tham số|参数|參數|파라미터)\s+(\d+))\b", re.IGNORECASE
+)
+_ASSOCIATION_VALUE = r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?!\w|\.\d)"
+_FORWARD_VALUE = re.compile(
+    rf"\s*(?:(?:=|:)|(?:to|at|is|thành|bằng|là)|(?:값을|값은|값|을|를|은|는))?"
+    rf"\s*({_ASSOCIATION_VALUE})", re.IGNORECASE
+)
+_REVERSE_VALUE = re.compile(
+    rf"(?<![\w.])({_ASSOCIATION_VALUE})\s+(?:cho|vào|to|into)\s*$", re.IGNORECASE
+)
+
+
+def _object_values(text: str) -> dict[str, Counter[str]]:
+    """Explicit adjacent assignments only; not a general vendor-language parser."""
+    text = _normalise_quantity_units(TAG_PATTERN.sub("", text))
+    objects = [(m.start(), m.end(), m[0]) for m in TECHNICAL_IDENTIFIER_PATTERN.finditer(text)]
+    for match in _NAMED_OBJECT_PATTERN.finditer(text):
+        axis = match[1] or match[2]
+        name = f"axis:{axis.upper()}" if axis else f"parameter:{match[3]}"
+        objects.append((match.start(), match.end(), name))
+    values: dict[str, Counter[str]] = {}
+    for start, end, name in objects:
+        forward = _FORWARD_VALUE.match(text, end)
+        reverse = _REVERSE_VALUE.search(text[max(0, start - 50):start])
+        value = forward or reverse
+        if value:
+            values.setdefault(name, Counter())[value[1]] += 1
+    return values
+
+
+def _association_differences(source: str, translated: str) -> list[InvariantDifference]:
+    source_values, target_values = _object_values(source), _object_values(translated)
+    return [
+        InvariantDifference(f"value association {key}", _expanded(source_values[key]), _expanded(target_values[key]))
+        for key in sorted(source_values.keys() & target_values.keys())
+        if source_values[key] != target_values[key]
+    ]
+
+
+_SEMANTIC_CUES = (
+    ("prohibition", r"\b(?:do not|must not|shall not|never|is not permitted|is not allowed)\b|하지\s*마|금지|禁止|不得|严禁|嚴禁|请勿|請勿|切勿",
+     r"\b(?:không|cấm|đừng)\b"),
+    ("mandatory", r"\b(?:must|shall)\b(?!\s+not\b)|반드시|하여야\s*한다|해야\s*한다|必须|必須",
+     r"\b(?:phải|bắt buộc|nhất thiết)\b"),
+    ("recommended", r"\b(?:should|recommended)\b|권장|建议|建議",
+     r"\b(?:nên|khuyến nghị|khuyến cáo)\b"),
+    ("permission", r"\b(?:is permitted|is allowed)\b",
+     r"\b(?:được phép|cho phép|có thể)\b"),
+)
+_COMPILED_SEMANTIC_CUES = tuple(
+    (name, re.compile(src, re.IGNORECASE), re.compile(dst, re.IGNORECASE))
+    for name, src, dst in _SEMANTIC_CUES
+)
+_ORDER_PATTERN = re.compile(r"\b(before|after|trước khi|sau khi|trước|sau)\b", re.IGNORECASE)
+
+
+def _anchored_order(text: str) -> tuple[str, str] | None:
+    """Compare before/after only when both actions have one distinct stable anchor."""
+    text = TAG_PATTERN.sub("", text)
+    matches = list(_ORDER_PATTERN.finditer(text))
+    if len(matches) != 1:
+        return None
+    relation = matches[0]
+    if text[:relation.start()].strip():
+        left, right = text[:relation.start()], text[relation.end():]
+    else:
+        pieces = text[relation.end():].split(",", 1)
+        if len(pieces) != 2:
+            return None
+        right, left = pieces
+    def anchors(value: str) -> set[str]:
+        return set(_regex_tokens(TECHNICAL_IDENTIFIER_PATTERN, value) + _regex_tokens(POLARITY_PATTERN, value))
+    first, second = anchors(left), anchors(right)
+    if len(first) != 1 or len(second) != 1 or first == second:
+        return None
+    pair = (next(iter(first)), next(iter(second)))
+    return pair if relation[0].casefold().startswith(("before", "trước")) else pair[::-1]
+
+
+def validate_lightweight_semantics(source: str, translated: str, target_language: str | None) -> None:
+    """Flag supported cue loss/direction changes without a second model pass.
+
+    Only Vietnamese target cues and explicitly anchored order are checked.
+    Passing this guard does not prove semantic equivalence or negation scope.
+    """
+    if target_language != "vi":
+        return
+    source, translated = TAG_PATTERN.sub("", source), TAG_PATTERN.sub("", translated)
+    differences = [
+        InvariantDifference(f"semantic {name}", (name,), ())
+        for name, source_pattern, target_pattern in _COMPILED_SEMANTIC_CUES
+        if source_pattern.search(source) and not target_pattern.search(translated)
+    ]
+    source_order, target_order = _anchored_order(source), _anchored_order(translated)
+    if source_order and target_order and source_order != target_order:
+        differences.append(InvariantDifference("semantic order", source_order, target_order))
+    if differences:
+        raise TechnicalInvariantError(differences)
 
 
 def validate_technical_invariants(source: str, translated: str) -> None:
     """Reject changed, removed, duplicated, or invented deterministic tokens."""
-    differences: list[InvariantDifference] = []
+    differences: list[InvariantDifference] = _association_differences(source, translated)
     for category, extractor in TOKEN_CHECKS:
         source_tokens = Counter(extractor(source))
         translated_tokens = Counter(extractor(translated))

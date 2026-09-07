@@ -17,6 +17,15 @@ most 30 segments / 12,000 source characters, carries identity through every
 batch, includes an optional confirmed terminology map once per batch, and
 validates all results before the single final rebuild. Valid units survive a
 partial failure; only failed units are retried, up to three attempts.
+An oversized single source is excluded intact into an adjacent oversized JSONL,
+not sent in an over-budget batch. Rebuild matches segment IDs; safe shared IDs
+can reuse validated, identity-bound cache entries with the same terminology and
+translation-rules fingerprint. Bump `TRANSLATION_RULES_VERSION` when classifier
+or validation semantics change. Cache is not disabled by default.
+ASCII single-token terminology uses word boundaries on source and target;
+`pin` does not match `shipping`. CJK, phrases, and punctuation-bearing terms
+retain substring matching. Matcher revision scopes only nonempty terminology
+maps in the cache fingerprint.
 
 Each run returns a `TranslationReport`: total, translated, preserved, and
 unresolved segment counts; the segments left in the source language and why;

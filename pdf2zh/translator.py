@@ -16,7 +16,8 @@ from typing import Any, ClassVar
 import requests
 
 from pdf2zh.cache import TranslationCache
-from pdf2zh.invariants import TechnicalInvariantError, validate_technical_invariants
+from pdf2zh.invariants import TechnicalInvariantError, validate_technical_invariants, validate_lightweight_semantics
+from pdf2zh.terminology import TerminologyConsistencyError, terminology_fingerprint, validate_confirmed_terminology
 
 logger = logging.getLogger(__name__)
 
@@ -87,18 +88,21 @@ class BaseTranslator:
         model: str | None = None,
         *,
         ignore_cache: bool = False,
+        envs: dict[str, Any] | None = None,
         **_: Any,
     ) -> None:
         self.lang_in = self.lang_map.get(lang_in.lower(), lang_in)
         self.lang_out = self.lang_map.get(lang_out.lower(), lang_out)
         self.model = model
         self.ignore_cache = ignore_cache
+        self.terminology = dict((envs or {}).get("terminology") or {})
         self.cache = TranslationCache(
             self.name,
             {
                 "lang_in": self.lang_in,
                 "lang_out": self.lang_out,
                 "model": model,
+                "rules_terminology": terminology_fingerprint(self.terminology),
             },
         )
         self.cache_hits = 0
@@ -114,8 +118,8 @@ class BaseTranslator:
             cached = self.cache.get(text)
             if cached is not None:
                 try:
-                    validate_translation_result(text, cached)
-                except (FormulaPlaceholderError, TechnicalInvariantError):
+                    self.validate(text, cached)
+                except (FormulaPlaceholderError, TechnicalInvariantError, TerminologyConsistencyError):
                     logger.warning(
                         "Ignoring unsafe cached translation for segment %s",
                         segment_identifier(text),
@@ -133,10 +137,14 @@ class BaseTranslator:
             elapsed = time.perf_counter() - started
             with self._metrics_lock:
                 self.translation_seconds += elapsed
-        validate_translation_result(text, translated)
+        self.validate(text, translated)
         if use_cache:
             self.cache.set(text, translated)
         return translated
+
+    def validate(self, source: str, translated: str) -> None:
+        validate_translation_result(source, translated, target_language=self.lang_out)
+        validate_confirmed_terminology(source, translated, self.terminology)
 
     def do_translate(self, text: str) -> str:
         """Translate one engine-sized text segment."""
@@ -282,12 +290,13 @@ def validate_style_tags(source: str, translated: str) -> None:
         raise FormulaPlaceholderError("style tags changed during translation")
 
 
-def validate_translation_result(source: str, translated: str) -> None:
+def validate_translation_result(source: str, translated: str, *, target_language: str | None = None) -> None:
     """Validate every deterministic guard before a result can enter the cache."""
     if placeholders(source) != placeholders(translated):
         raise FormulaPlaceholderError("formula placeholders changed during translation")
     validate_style_tags(source, translated)
     validate_technical_invariants(source, translated)
+    validate_lightweight_semantics(source, translated, target_language)
 
 
 def segment_identifier(text: str) -> str:
@@ -297,6 +306,8 @@ def segment_identifier(text: str) -> str:
 
 def load_segment_tables(
     path: str | None,
+    *,
+    target_language: str | None = None,
 ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
     """Load a source-to-translation table from a JSONL file of {"src", "dst"} records.
 
@@ -348,6 +359,7 @@ def load_segment_tables(
                 continue
             try:
                 validate_technical_invariants(source, translation)
+                validate_lightweight_semantics(source, translation, target_language)
             except TechnicalInvariantError as error:
                 logger.warning(
                     "%s line %d: technical invariants changed for segment %s (%s); "
@@ -359,6 +371,9 @@ def load_segment_tables(
                 )
                 continue
             table[source] = translation
+            # Legacy records can identify shared content, never an occurrence ID.
+            if identity is None:
+                identity = segment_identifier(source)
             if identity is not None:
                 if not isinstance(identity, str):
                     raise ValueError(f"{path} line {number}: 'segment_id' must be a string")
@@ -404,10 +419,11 @@ class HandoffTranslator(BaseTranslator):
             lang_out,
             model,
             ignore_cache=ignore_cache,
+            envs=envs,
             **kwargs,
         )
         envs = envs or {}
-        self.table, self.table_by_id = load_segment_tables(envs.get("segments_in"))
+        self.table, self.table_by_id = load_segment_tables(envs.get("segments_in"), target_language=self.lang_out)
         self.misses_path = envs.get("segments_out")
         self._seen: set[str] = set()
         self._resolved: set[str] = set()
@@ -429,28 +445,33 @@ class HandoffTranslator(BaseTranslator):
         """Resolve table/cache hits and record misses without caching passthroughs."""
         text = normalise_number_abbreviation(text)
         use_cache = not (self.ignore_cache or ignore_cache) and is_safe_cache_key(text)
+        if identity is not None:
+            # Cache reuse must resolve the same shared identity, never another
+            # occurrence or the legacy source-only namespace.
+            use_cache = use_cache and identity == segment_identifier(text)
+        cache_key = json.dumps([identity, text], ensure_ascii=False) if identity is not None else text
         translation = None
         if identity is not None and identity in self.table_by_id:
             expected_source, candidate = self.table_by_id[identity]
             if expected_source == text:
                 translation = candidate
-        if translation is None:
+        if identity is None:
             translation = self.table.get(text)
         if translation is not None:
-            validate_translation_result(text, translation)
+            self.validate(text, translation)
             if use_cache:
-                self.cache.set(text, translation)
+                self.cache.set(cache_key, translation)
             with self._metrics_lock:
                 self.table_hits += 1
             with self._lock:
                 self._resolved.add(identity or text)
             return translation
         if use_cache:
-            cached = self.cache.get(text)
+            cached = self.cache.get(cache_key)
             if cached is not None:
                 try:
-                    validate_translation_result(text, cached)
-                except (FormulaPlaceholderError, TechnicalInvariantError):
+                    self.validate(text, cached)
+                except (FormulaPlaceholderError, TechnicalInvariantError, TerminologyConsistencyError):
                     logger.warning(
                         "Ignoring unsafe cached handoff translation for segment %s",
                         segment_identifier(text),

@@ -16,6 +16,18 @@ Executable PLC/robot instruction tokens are also immutable. Value/unit spacing
 is normalized for comparison, so `2350mm` and `2350 mm` are equivalent while a
 changed value, sign, or unit is rejected.
 
+Explicit adjacent assignments to recognized identifiers, numbered parameters,
+and named axes are compared by object/value association when both source and
+target use supported forms (including reordered clauses). This is not a full
+vendor grammar. English opcode words are protected as code only in supported
+instruction syntax; a prose sentence starting with `SET` still needs translation.
+
+Vietnamese-target validation also flags loss of recognized prohibition,
+requirement, recommendation, and permission cues in English/Korean/Chinese.
+Before/after direction is compared only when both actions have distinct stable
+technical anchors. These lightweight guards feed the existing targeted retry;
+they do not prove all negation scope, paraphrases, or action semantics.
+
 ## Conflict resolution
 
 Apply one order only:

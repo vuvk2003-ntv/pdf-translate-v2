@@ -25,6 +25,7 @@ from pdf2zh.rules import (
     line_height_for_language,
     min_line_height_for_language,
 )
+from pdf2zh.invariants import is_executable_code_line
 from pdf2zh.translator import (
     ENGINES,
     BaseTranslator,
@@ -38,10 +39,6 @@ STYLE_TAG_PATTERN = re.compile(r"<(/?)s([123])>", re.IGNORECASE)
 PLACEHOLDER_ONLY_PATTERN = re.compile(r"\{v\d+\}")
 IDENTITY_ORIENTATION = (1.0, 0.0, 0.0, 1.0)
 BASE14_STYLE_FONTS = {0: "tiro", 1: "tibo", 2: "tiit", 3: "tibi"}
-CODE_INSTRUCTION_PATTERN = re.compile(
-    r"^\s*(?:\d+\s*[:)]\s*)?(?:DFROM_M|DTO_M|MOV|BMOV|SET|RST|CASE|IF|"
-    r"THEN|TON|MOVJ|MOVL|NWAIT)\b",
-)
 TECHNICAL_ONLY_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])(?:"
     r"0x[0-9A-Fa-f]+|(?:ZR|D|M|X|Y|R|P|Z|B|W|L|F|V)\d+|"
@@ -367,7 +364,7 @@ def needs_model_translation(segment: str) -> bool:
     if COMMON_STANDALONE_TECHNICAL_TERM_PATTERN.fullmatch(visible):
         return False
     lines = [line.strip() for line in visible.splitlines() if line.strip()]
-    if lines and all(CODE_INSTRUCTION_PATTERN.match(line) for line in lines):
+    if lines and all(is_executable_code_line(line) for line in lines):
         return False
     remainder = TECHNICAL_ONLY_PATTERN.sub("", visible)
     remainder = re.sub(r"[\s,;:|/()\[\]{}.+\-=×±≤≥]+", "", remainder)

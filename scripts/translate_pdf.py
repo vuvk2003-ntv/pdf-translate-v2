@@ -215,6 +215,7 @@ def _parser() -> argparse.ArgumentParser:
         help="handoff engine: write the segments left untranslated here, as JSONL",
     )
     parser.add_argument("--ignore-cache", action="store_true")
+    parser.add_argument("--terminology", type=Path, help="confirmed terminology JSON; scopes cache validity")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -410,7 +411,7 @@ def _run_engine(
     threads: int,
     ignore_cache: bool,
     engine: str,
-    envs: dict[str, str],
+    envs: dict[str, object],
     on_progress: Callable[[int, int], None] | None = None,
 ) -> "TranslationReport":
     """Run the core and return what it could not translate, and why."""
@@ -456,12 +457,26 @@ def translate_pdf(
     engine: str = "google",
     segments: Path | None = None,
     emit_segments: Path | None = None,
+    terminology: Path | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> Translation:
     """Translate one PDF, reporting any segments the engine could not translate."""
     _require_core()
     source = _validate_input(input_pdf)
-    envs = _segment_envs(segments, emit_segments, {source})
+    protected_paths = {source}
+    terms = None
+    if terminology is not None:
+        from pdf2zh.terminology import load_terminology
+
+        terminology = terminology.expanduser().resolve()
+        protected_paths.add(terminology)
+        try:
+            terms = load_terminology(terminology)
+        except (OSError, ValueError) as error:
+            raise TranslationError(f"Cannot load terminology: {terminology}: {error}") from error
+    envs: dict[str, object] = dict(_segment_envs(segments, emit_segments, protected_paths))
+    if terms is not None:
+        envs["terminology"] = terms
     confidentiality_markers = _detect_confidentiality_markers(source, pages)
     if confidentiality_markers:
         logger.warning(
@@ -613,6 +628,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             engine=args.engine,
             segments=args.segments,
             emit_segments=args.emit_segments,
+            terminology=args.terminology,
         )
     except TranslationError as error:
         print(f"error: {error}", file=sys.stderr)
