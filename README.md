@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <sub>Xây dựng và duy trì bởi <a href="https://www.tiktok.com/@huyg.ai">Lê Ngọc Gia Huy · huyg.ai</a></sub>
+  <sub>Xây dựng và duy trì bởi <NTV>
 </p>
 
 <p align="center">
@@ -63,21 +63,9 @@ PDF Translate là ứng dụng mã nguồn mở dành cho Windows, macOS và And
 
 ### Windows
 
-1. **[Tải PDF Translate cho Windows](https://github.com/breslee1707/VI-Translate/releases/latest/download/PDFTranslate-windows.zip)** (`.zip`, khoảng 199 MB).
+1. **[Tải PDF Translate cho Windows](https://github.com/vuvk2003-ntv/pdf-translate-v2)** (`.zip`, khoảng 199 MB).
 2. Giải nén toàn bộ file vừa tải.
 3. Mở `PDFTranslate.exe`.
-
-### macOS
-
-1. Tải bản phù hợp: **[Apple Silicon](https://github.com/breslee1707/VI-Translate/releases/latest/download/PDFTranslate-macos-apple-silicon.dmg)** cho Mac M1/M2/M3/M4/M5 hoặc **[Intel](https://github.com/breslee1707/VI-Translate/releases/latest/download/PDFTranslate-macos-intel.dmg)** cho Mac Intel.
-2. Mở file `.dmg`, kéo **PDF Translate** vào thư mục **Applications**.
-3. Trong lần chạy đầu, bấm chuột phải vào ứng dụng → **Open** → **Open**.
-
-### Android
-
-1. **[Tải APK từ bản phát hành Android mới nhất](https://github.com/breslee1707/VI-Translate/releases?q=android-v)** (`PDFTranslate-android-*.apk`). Bản Android được đánh tag riêng theo dạng `android-v*`.
-2. Trên điện thoại, cho phép trình duyệt hoặc trình quản lý file **cài ứng dụng từ nguồn không xác định**, rồi mở file APK.
-3. Ứng dụng cần Android 8.0 trở lên.
 
 Muốn tự biên dịch:
 
@@ -335,5 +323,5 @@ Thư mục [`pdf2zh/`](pdf2zh/) là bản fork của nhân xử lý PDF từ [PD
 </p>
 
 <p align="center">
-  <sub>Xây dựng &amp; duy trì bởi <a href="https://www.tiktok.com/@huyg.ai">Lê Ngọc Gia Huy (huyg.ai)</a></sub>
+  <sub>Xây dựng &amp; duy trì bởi <NTV>
 </p>
