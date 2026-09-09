@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import html
 import hashlib
+import html
 import json
 import logging
 import re
@@ -11,13 +11,27 @@ import threading
 import time
 import unicodedata
 from collections import Counter
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 import requests
 
 from pdf2zh.cache import TranslationCache
-from pdf2zh.invariants import TechnicalInvariantError, validate_technical_invariants, validate_lightweight_semantics
-from pdf2zh.terminology import TerminologyConsistencyError, terminology_fingerprint, validate_confirmed_terminology
+from pdf2zh.invariants import (
+    TechnicalInvariantError,
+    VerifiedProperNameError,
+    contains_hangul,
+    is_standalone_verified_proper_name,
+    protected_verified_proper_names,
+    validate_korean_english_spans,
+    validate_lightweight_semantics,
+    validate_technical_invariants,
+    validate_verified_proper_names,
+)
+from pdf2zh.terminology import (
+    TerminologyConsistencyError,
+    terminology_fingerprint,
+    validate_confirmed_terminology,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +40,67 @@ INTERNAL_PLACEHOLDER_PATTERN = re.compile(r"\{\s*v([\d\s]+)\}", re.IGNORECASE)
 PAIRED_PLACEHOLDER_PATTERN = re.compile(r"<b(\d+)></b\1>")
 STYLE_TAG_PATTERN = re.compile(r"<(/?)s([123])>", re.IGNORECASE)
 SAFE_CACHE_PLACEHOLDER_PATTERN = re.compile(r"\{v\d+\}|</?[bs]\d+>", re.IGNORECASE)
+
+
+class ProperNameMask(NamedTuple):
+    identifier: int
+    source: str
+
+
+def mask_verified_proper_names(
+    text: str,
+    terminology: dict[str, str] | None = None,
+) -> tuple[str, tuple[ProperNameMask, ...]]:
+    """Hide reviewed names behind fresh formula-safe tag pairs for a provider."""
+    spans = protected_verified_proper_names(text, terminology)
+    if not spans:
+        return text, ()
+    used_ids = [int(identifier) for identifier in re.findall(r"</?b(\d+)>", text)]
+    next_identifier = max(used_ids, default=-1) + 1
+    pieces: list[str] = []
+    masks: list[ProperNameMask] = []
+    cursor = 0
+    for offset, span in enumerate(spans):
+        identifier = next_identifier + offset
+        pieces.append(text[cursor : span.start])
+        pieces.append(f"<b{identifier}></b{identifier}>")
+        masks.append(ProperNameMask(identifier, text[span.start : span.end]))
+        cursor = span.end
+    pieces.append(text[cursor:])
+    return "".join(pieces), tuple(masks)
+
+
+def restore_verified_proper_names(
+    translated: str,
+    masks: tuple[ProperNameMask, ...],
+) -> str:
+    """Validate provider-safe name tokens and restore exact reviewed spelling."""
+    if not masks:
+        return translated
+    identifiers = "|".join(str(mask.identifier) for mask in masks)
+    tag_pattern = re.compile(rf"</?b(?:{identifiers})>")
+    expected_tags = [
+        tag
+        for mask in masks
+        for tag in (f"<b{mask.identifier}>", f"</b{mask.identifier}>")
+    ]
+    if tag_pattern.findall(translated) != expected_tags:
+        raise VerifiedProperNameError(
+            "verified proper-name provider placeholders were dropped, duplicated, or reordered"
+        )
+    restored = translated
+    for mask in masks:
+        token = f"<b{mask.identifier}></b{mask.identifier}>"
+        if restored.count(token) != 1:
+            raise VerifiedProperNameError(
+                "verified proper-name provider placeholder pair is malformed"
+            )
+        restored = restored.replace(token, mask.source, 1)
+    if tag_pattern.search(restored):
+        raise VerifiedProperNameError(
+            "verified proper-name provider placeholder leaked into translated text"
+        )
+    return restored
 
 
 class FormulaPlaceholderError(ValueError):
@@ -113,13 +188,20 @@ class BaseTranslator:
     def translate(self, text: str, ignore_cache: bool = False) -> str:
         """Translate text, consulting the persistent cache unless bypassed."""
         text = normalise_number_abbreviation(text)
+        if is_standalone_verified_proper_name(text, self.terminology):
+            return text
         use_cache = not (self.ignore_cache or ignore_cache) and is_safe_cache_key(text)
         if use_cache:
             cached = self.cache.get(text)
             if cached is not None:
                 try:
                     self.validate(text, cached)
-                except (FormulaPlaceholderError, TechnicalInvariantError, TerminologyConsistencyError):
+                except (
+                    FormulaPlaceholderError,
+                    TechnicalInvariantError,
+                    TerminologyConsistencyError,
+                    VerifiedProperNameError,
+                ):
                     logger.warning(
                         "Ignoring unsafe cached translation for segment %s",
                         segment_identifier(text),
@@ -132,7 +214,11 @@ class BaseTranslator:
         with self._metrics_lock:
             self.translation_requests += 1
         try:
-            translated = self.do_translate(text)
+            provider_text, proper_name_masks = mask_verified_proper_names(
+                text, self.terminology
+            )
+            translated = self.do_translate(provider_text)
+            translated = restore_verified_proper_names(translated, proper_name_masks)
         finally:
             elapsed = time.perf_counter() - started
             with self._metrics_lock:
@@ -143,7 +229,12 @@ class BaseTranslator:
         return translated
 
     def validate(self, source: str, translated: str) -> None:
-        validate_translation_result(source, translated, target_language=self.lang_out)
+        validate_translation_result(
+            source,
+            translated,
+            target_language=self.lang_out,
+            terminology=self.terminology,
+        )
         validate_confirmed_terminology(source, translated, self.terminology)
 
     def do_translate(self, text: str) -> str:
@@ -154,7 +245,13 @@ class BaseTranslator:
         """Whether this engine resolved the segment instead of passing it through."""
         return True
 
-    def translate_with_identity(self, text: str, identity: str) -> str:
+    def translate_with_identity(
+        self,
+        text: str,
+        identity: str,
+        *,
+        context: dict[str, str] | None = None,
+    ) -> str:
         """Translate one occurrence; ordinary engines do not need its identity."""
         return self.translate(text)
 
@@ -290,13 +387,21 @@ def validate_style_tags(source: str, translated: str) -> None:
         raise FormulaPlaceholderError("style tags changed during translation")
 
 
-def validate_translation_result(source: str, translated: str, *, target_language: str | None = None) -> None:
+def validate_translation_result(
+    source: str,
+    translated: str,
+    *,
+    target_language: str | None = None,
+    terminology: dict[str, str] | None = None,
+) -> None:
     """Validate every deterministic guard before a result can enter the cache."""
     if placeholders(source) != placeholders(translated):
         raise FormulaPlaceholderError("formula placeholders changed during translation")
     validate_style_tags(source, translated)
+    validate_verified_proper_names(source, translated, terminology)
     validate_technical_invariants(source, translated)
     validate_lightweight_semantics(source, translated, target_language)
+    validate_korean_english_spans(source, translated, terminology)
 
 
 def segment_identifier(text: str) -> str:
@@ -308,6 +413,7 @@ def load_segment_tables(
     path: str | None,
     *,
     target_language: str | None = None,
+    terminology: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
     """Load a source-to-translation table from a JSONL file of {"src", "dst"} records.
 
@@ -358,8 +464,22 @@ def load_segment_tables(
                 )
                 continue
             try:
-                validate_technical_invariants(source, translation)
-                validate_lightweight_semantics(source, translation, target_language)
+                validate_translation_result(
+                    source,
+                    translation,
+                    target_language=target_language,
+                    terminology=terminology,
+                )
+            except VerifiedProperNameError as error:
+                logger.warning(
+                    "%s line %d: verified proper-name integrity changed for segment %s (%s); "
+                    "segment left untranslated",
+                    path,
+                    number,
+                    segment_identifier(source),
+                    error,
+                )
+                continue
             except TechnicalInvariantError as error:
                 logger.warning(
                     "%s line %d: technical invariants changed for segment %s (%s); "
@@ -423,7 +543,11 @@ class HandoffTranslator(BaseTranslator):
             **kwargs,
         )
         envs = envs or {}
-        self.table, self.table_by_id = load_segment_tables(envs.get("segments_in"), target_language=self.lang_out)
+        self.table, self.table_by_id = load_segment_tables(
+            envs.get("segments_in"),
+            target_language=self.lang_out,
+            terminology=self.terminology,
+        )
         self.misses_path = envs.get("segments_out")
         self._seen: set[str] = set()
         self._resolved: set[str] = set()
@@ -434,16 +558,30 @@ class HandoffTranslator(BaseTranslator):
             open(self.misses_path, "w", encoding="utf-8").close()
 
     def translate(self, text: str, ignore_cache: bool = False) -> str:
-        return self._translate(text, None, ignore_cache)
+        return self._translate(text, None, ignore_cache, None)
 
-    def translate_with_identity(self, text: str, identity: str) -> str:
-        return self._translate(text, identity, False)
+    def translate_with_identity(
+        self,
+        text: str,
+        identity: str,
+        *,
+        context: dict[str, str] | None = None,
+    ) -> str:
+        return self._translate(text, identity, False, context)
 
     def _translate(
-        self, text: str, identity: str | None, ignore_cache: bool
+        self,
+        text: str,
+        identity: str | None,
+        ignore_cache: bool,
+        context: dict[str, str] | None,
     ) -> str:
         """Resolve table/cache hits and record misses without caching passthroughs."""
         text = normalise_number_abbreviation(text)
+        if is_standalone_verified_proper_name(text, self.terminology):
+            with self._lock:
+                self._resolved.add(identity or text)
+            return text
         use_cache = not (self.ignore_cache or ignore_cache) and is_safe_cache_key(text)
         if identity is not None:
             # Cache reuse must resolve the same shared identity, never another
@@ -471,7 +609,12 @@ class HandoffTranslator(BaseTranslator):
             if cached is not None:
                 try:
                     self.validate(text, cached)
-                except (FormulaPlaceholderError, TechnicalInvariantError, TerminologyConsistencyError):
+                except (
+                    FormulaPlaceholderError,
+                    TechnicalInvariantError,
+                    TerminologyConsistencyError,
+                    VerifiedProperNameError,
+                ):
                     logger.warning(
                         "Ignoring unsafe cached handoff translation for segment %s",
                         segment_identifier(text),
@@ -482,7 +625,7 @@ class HandoffTranslator(BaseTranslator):
                     with self._lock:
                         self._resolved.add(identity or text)
                     return cached
-        self._record_miss(text, identity)
+        self._record_miss(text, identity, context)
         return text
 
     def do_translate(self, text: str) -> str:
@@ -509,7 +652,12 @@ class HandoffTranslator(BaseTranslator):
             )
         return result
 
-    def _record_miss(self, text: str, identity: str | None = None) -> None:
+    def _record_miss(
+        self,
+        text: str,
+        identity: str | None = None,
+        context: dict[str, str] | None = None,
+    ) -> None:
         """Append one untranslated segment, deduplicated, for the caller to fill in."""
         with self._lock:
             miss_identity = identity or segment_identifier(text)
@@ -521,17 +669,22 @@ class HandoffTranslator(BaseTranslator):
             if not self.misses_path:
                 return
             with open(self.misses_path, "a", encoding="utf-8") as stream:
-                stream.write(
-                    json.dumps(
-                        {
-                            "type": "untrusted_source_content",
-                            "segment_id": miss_identity,
-                            "src": text,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+                record = {
+                    "type": "untrusted_source_content",
+                    "segment_id": miss_identity,
+                    "src": text,
+                }
+                if (
+                    context is not None
+                    and contains_hangul(text)
+                    and set(context) == {"type", "kind", "text"}
+                    and context.get("type") == "untrusted_context"
+                    and context.get("kind") == "adjacent_segment"
+                    and isinstance(context.get("text"), str)
+                    and 0 < len(context["text"]) <= 300
+                ):
+                    record["context"] = context
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 ENGINES: dict[str, type[BaseTranslator]] = {

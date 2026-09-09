@@ -26,27 +26,33 @@ PROBE_FONT_PATH = next(
     None,
 )
 
+from pdfminer.pdfinterp import PDFGraphicState, PDFResourceManager
+from pdfminer.psparser import PSLiteral
+
 from pdf2zh.converter import (
     IDENTITY_ORIENTATION,
     OpType,
+    PDFConverterEx,
     TextStyle,
     available_height_below,
+    is_outside_page,
+    largest_fitting_cell_font_size,
+    line_ends_paragraph,
     line_offsets,
     matrix_font_size,
     normalised_text_matrix,
     operation_ink,
-    paragraph_width_budget,
-    is_outside_page,
-    line_ends_paragraph,
     output_font_lacks_glyph,
-    run_is_prose,
-    stroke_colour_from_fill,
+    paragraph_width_budget,
+    partition_shared_cell_bounds,
     preferred_translation,
     rescale_operations,
+    run_is_prose,
     should_translate_rotated_text,
     size_should_follow_body,
-    styled_text_matrix,
+    stroke_colour_from_fill,
     styled_character_text,
+    styled_text_matrix,
     text_fits_box_at_minimum_size,
     text_orientation,
     text_style_from_descriptor,
@@ -56,10 +62,7 @@ from pdf2zh.converter import (
     vertical_shift_to_bounds,
 )
 from pdf2zh.high_level import output_style_font_paths
-from pdf2zh.converter import PDFConverterEx
 from pdf2zh.pdfinterp import PDFPageInterpreterEx, extgstate_is_safe
-from pdfminer.pdfinterp import PDFGraphicState, PDFResourceManager
-from pdfminer.psparser import PSLiteral
 
 
 class RecordingDevice:
@@ -328,6 +331,142 @@ class TableCellFitTests(unittest.TestCase):
         self.assertFalse(
             text_fits_box_at_minimum_size("{v0}", 10, 10, 10, [20], self._measure)
         )
+
+    def test_a_roomy_cell_wraps_before_it_shrinks(self):
+        # At 10pt this is two lines inside a 60x24 cell. The old pre-wrap
+        # width ratio treated it as one 95pt line and selected about 6pt.
+        self.assertEqual(
+            largest_fitting_cell_font_size(
+                "one two three four",
+                60,
+                60,
+                24,
+                10,
+                [],
+                lambda _character, size: size * 0.5,
+                1.1,
+            ),
+            10,
+        )
+
+    def test_page_95_short_label_uses_source_size_inside_same_cell(self):
+        self.assertEqual(
+            largest_fitting_cell_font_size(
+                "ANGLE (góc)",
+                113,
+                113,
+                15,
+                9.12,
+                [],
+                lambda _character, size: size * 0.45,
+                1.1,
+            ),
+            9.12,
+        )
+
+    def test_large_page_blank_does_not_change_the_cell_height_budget(self):
+        size = largest_fitting_cell_font_size(
+            "Potential of Hydrogen (nồng độ ion hydro)",
+            155,
+            155,
+            15,
+            9.12,
+            [],
+            lambda _character, candidate: candidate * 0.45,
+            1.1,
+        )
+        self.assertIsNotNone(size)
+        self.assertGreater(size, 5.15)
+        self.assertLessEqual(size, 9.12)
+
+    def test_cell_font_never_grows_past_source_hierarchy(self):
+        self.assertEqual(
+            largest_fitting_cell_font_size(
+                "Nhãn",
+                300,
+                300,
+                300,
+                8,
+                [],
+                lambda _character, size: size * 0.5,
+                1.1,
+            ),
+            8,
+        )
+
+    def test_a_narrow_cell_uses_the_largest_safe_wrapped_size(self):
+        size = largest_fitting_cell_font_size(
+            "one two three four",
+            30,
+            30,
+            24,
+            10,
+            [],
+            lambda _character, candidate: candidate * 0.5,
+            1.1,
+        )
+        self.assertIsNotNone(size)
+        self.assertGreater(size, 5)
+        self.assertLess(size, 10)
+
+    def test_cell_border_clearance_can_force_safe_fallback(self):
+        # Two half-size lines consume exactly 11pt of ink; a 10.9pt usable
+        # region must not be accepted and then drawn across its border.
+        self.assertIsNone(
+            largest_fitting_cell_font_size(
+                "one two",
+                15,
+                15,
+                10.9,
+                10,
+                [],
+                lambda _character, size: size,
+                1.1,
+            )
+        )
+
+    def test_cell_fit_measures_the_style_that_will_be_rendered(self):
+        self.assertIsNone(
+            largest_fitting_cell_font_size(
+                "<s1>one two</s1>",
+                30,
+                30,
+                10.9,
+                10,
+                [],
+                lambda _character, size: size * 0.1,
+                1.1,
+                lambda _character, style, size: size if style == 1 else size * 0.1,
+            )
+        )
+
+    def test_an_unbreakable_token_that_cannot_fit_uses_safe_fallback(self):
+        self.assertIsNone(
+            largest_fitting_cell_font_size(
+                "IR-S10-80Z20S-INT",
+                30,
+                30,
+                30,
+                10,
+                [],
+                lambda _character, size: size * 0.5,
+                1.1,
+            )
+        )
+
+    def test_occurrences_sharing_a_merged_cell_get_disjoint_vertical_space(self):
+        bounds = partition_shared_cell_bounds(
+            [(0, 10, 20, 20), (0, 70, 20, 80)],
+            (0, 0, 100, 100),
+        )
+        self.assertEqual(bounds, [(0, 0, 100, 45), (0, 45, 100, 100)])
+
+    def test_same_baseline_fragments_get_disjoint_horizontal_space(self):
+        bounds = partition_shared_cell_bounds(
+            [(10, 40, 30, 50), (40, 40, 80, 50)],
+            (0, 0, 100, 100),
+        )
+        self.assertEqual(bounds, [(0, 0, 40, 100), (40, 0, 100, 100)])
 
 
 class OrientationAndStyleTests(unittest.TestCase):
@@ -610,11 +749,12 @@ class OrientationAndStyleTests(unittest.TestCase):
             )
         )
         self.assertTrue(extgstate_is_safe({}))
+        self.assertTrue(extgstate_is_safe({"ca": 0.2, "CA": 0.2}))
 
     def test_a_graphics_state_that_could_hide_the_text_is_left_behind(self):
         """A page that reads as empty is worse than one whose black is a shade off."""
         self.assertFalse(extgstate_is_safe({"ca": 0}))
-        self.assertFalse(extgstate_is_safe({"CA": 0.5}))
+        self.assertFalse(extgstate_is_safe({"CA": 1.1}))
         self.assertFalse(extgstate_is_safe({"SMask": {"Type": "Mask"}}))
         self.assertFalse(extgstate_is_safe({"TR": {"FunctionType": 2}}))
 

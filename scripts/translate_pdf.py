@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
+import json
 import logging
 import os
 import re
@@ -43,6 +45,9 @@ TARGET_LANGUAGES = frozenset(
 )
 
 ENGINES = ("google", "handoff")
+EXECUTION_BACKEND = "bundled_pdf2zh"
+PAGE_ID_KEY = "PDFTranslatePageID"
+PAGE_GEOMETRY_TOLERANCE = 0.01
 
 # Measured on an eight-page sample: 2 threads 48s, 4 threads 30s, 8 threads 27s,
 # 12 threads 29s. Past four, the layout pass rather than the network is the floor,
@@ -81,6 +86,40 @@ class Translation(NamedTuple):
     output_bytes: int = 0
     output_font_references: int = 0
     unique_output_font_objects: int = 0
+    execution_backend: str | None = None
+    core_version: str | None = None
+    ruleset: str | None = None
+    source_file: Path | None = None
+    source_sha256: str | None = None
+    output_file: Path | None = None
+    output_sha256: str | None = None
+    source_page_count: int | None = None
+    output_page_count: int | None = None
+    page_geometry_match: bool | None = None
+    page_mapping_match: bool | None = None
+    engine: str | None = None
+    source_language: str | None = None
+    target_language: str | None = None
+    native_validator_status: str | None = None
+
+
+class CoreIdentity(NamedTuple):
+    version: str
+    ruleset: str
+    module_path: Path
+
+
+class PageGeometry(NamedTuple):
+    width: float
+    height: float
+    rotation: int
+
+
+class PdfFacts(NamedTuple):
+    sha256: str
+    page_count: int
+    geometry: tuple[PageGeometry, ...]
+    page_ids: tuple[str | None, ...]
 
 
 # record_translation_failure passes up either an exception class name or one of
@@ -230,7 +269,7 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         raise TranslationError("--segments and --emit-segments require --engine handoff")
 
 
-def _require_core() -> None:
+def _require_core() -> CoreIdentity:
     try:
         import pdf2zh
         importlib.import_module("pdf2zh.doclayout")
@@ -252,10 +291,116 @@ def _require_core() -> None:
     # A packaged build has no pip environment for a PyPI wheel to shadow the core,
     # and its module paths point inside the extraction directory rather than here.
     if getattr(sys, "frozen", False):
-        return
+        return CoreIdentity(
+            str(pdf2zh.__version__),
+            str(pdf2zh.__ruleset__),
+            Path(pdf2zh.__file__).resolve(),
+        )
     module_path = Path(pdf2zh.__file__).resolve()
     if not module_path.is_relative_to(BUNDLED_CORE):
         raise TranslationError(f"Refusing external PDF core: {module_path}")
+    return CoreIdentity(str(pdf2zh.__version__), str(pdf2zh.__ruleset__), module_path)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _pdf_facts(path: Path, *, role: str) -> PdfFacts:
+    """Read artifact facts independently; malformed PDFs cannot reach publish."""
+    try:
+        import pymupdf
+
+        sha256_before = _sha256(path)
+        with pymupdf.open(path) as document:
+            if not document.is_pdf or document.page_count < 1:
+                raise ValueError("document has no PDF pages")
+            geometry: list[PageGeometry] = []
+            page_ids: list[str | None] = []
+            for page in document:
+                geometry.append(
+                    PageGeometry(
+                        float(page.rect.width),
+                        float(page.rect.height),
+                        int(page.rotation),
+                    )
+                )
+                kind, value = document.xref_get_key(page.xref, PAGE_ID_KEY)
+                page_ids.append(value if kind == "string" else None)
+        sha256_after = _sha256(path)
+        if sha256_after != sha256_before:
+            raise ValueError("artifact changed while its facts were being inspected")
+    except Exception as error:
+        raise TranslationError(f"Cannot inspect {role} PDF {path}: {_describe(error)}") from error
+    return PdfFacts(sha256_after, len(geometry), tuple(geometry), tuple(page_ids))
+
+
+def _require_source_unchanged(source: Path, expected_sha256: str) -> None:
+    try:
+        actual_sha256 = _sha256(source)
+    except Exception as error:
+        raise TranslationError(
+            f"Source PDF became unreadable while the native engine was running: "
+            f"{source}: {_describe(error)}"
+        ) from error
+    if actual_sha256 != expected_sha256:
+        raise TranslationError(
+            f"Source PDF changed while the native engine was running: {source}"
+        )
+
+
+def _page_identity(source_sha256: str, page_index: int) -> str:
+    material = f"{EXECUTION_BACKEND}:{source_sha256}:{page_index}".encode("ascii")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _same_geometry(
+    source: tuple[PageGeometry, ...], target: tuple[PageGeometry, ...]
+) -> bool:
+    return len(source) == len(target) and all(
+        abs(first.width - second.width) <= PAGE_GEOMETRY_TOLERANCE
+        and abs(first.height - second.height) <= PAGE_GEOMETRY_TOLERANCE
+        and first.rotation == second.rotation
+        for first, second in zip(source, target)
+    )
+
+
+def _validate_candidate(
+    source_facts: PdfFacts,
+    candidate_facts: PdfFacts,
+    expected_page_ids: tuple[str, ...],
+) -> None:
+    if candidate_facts.page_count != source_facts.page_count:
+        raise TranslationError(
+            "Generated PDF failed page-count validation: "
+            f"source={source_facts.page_count}, output={candidate_facts.page_count}"
+        )
+    for page_number, (source_page, output_page) in enumerate(
+        zip(source_facts.geometry, candidate_facts.geometry), 1
+    ):
+        if source_page.rotation != output_page.rotation:
+            raise TranslationError(
+                "Generated PDF failed rotation validation on page "
+                f"{page_number}: source={source_page.rotation}, output={output_page.rotation}"
+            )
+        if (
+            abs(source_page.width - output_page.width) > PAGE_GEOMETRY_TOLERANCE
+            or abs(source_page.height - output_page.height) > PAGE_GEOMETRY_TOLERANCE
+        ):
+            raise TranslationError(
+                "Generated PDF failed page-size validation on page "
+                f"{page_number}: source={source_page.width:g}x{source_page.height:g}, "
+                f"output={output_page.width:g}x{output_page.height:g}"
+            )
+    if candidate_facts.page_ids != expected_page_ids:
+        raise TranslationError(
+            "Generated PDF failed page-mapping validation: native page identities are "
+            "missing, duplicated, or out of order"
+        )
 
 
 def _validate_input(path: Path) -> Path:
@@ -461,8 +606,20 @@ def translate_pdf(
     on_progress: Callable[[int, int], None] | None = None,
 ) -> Translation:
     """Translate one PDF, reporting any segments the engine could not translate."""
-    _require_core()
+    if engine not in ENGINES:
+        raise TranslationError(
+            f"Unsupported translation engine {engine!r}; expected one of: {', '.join(ENGINES)}"
+        )
+    core_identity = _require_core()
     source = _validate_input(input_pdf)
+    source_facts = _pdf_facts(source, role="source")
+    selected_pages = _pages_to_indices(pages)
+    if selected_pages is not None and any(
+        page < 0 or page >= source_facts.page_count for page in selected_pages
+    ):
+        raise TranslationError(
+            f"Page selection exceeds the {source_facts.page_count}-page source PDF"
+        )
     protected_paths = {source}
     terms = None
     if terminology is not None:
@@ -491,6 +648,10 @@ def translate_pdf(
         destination_dir = output_dir.expanduser().resolve()
         destination_dir.mkdir(parents=True, exist_ok=True)
         destination = destination_dir / f"{source.stem}-{target_language}.pdf"
+        if destination == source or (
+            destination.exists() and destination.samefile(source)
+        ):
+            raise TranslationError(f"Refusing to replace the source PDF: {source}")
         if destination.exists() and not overwrite:
             raise TranslationError(
                 f"Output already exists: {destination}. "
@@ -499,6 +660,13 @@ def translate_pdf(
 
     with tempfile.TemporaryDirectory(prefix="pdf-translate-", dir=destination_dir) as temp:
         temp_output = Path(temp)
+        expected_page_ids: tuple[str, ...] = ()
+        if destination is not None:
+            expected_page_ids = tuple(
+                _page_identity(source_facts.sha256, page_index)
+                for page_index in range(source_facts.page_count)
+            )
+            envs["page_identity"] = expected_page_ids
         try:
             report = _run_engine(
                 source,
@@ -513,9 +681,16 @@ def translate_pdf(
                 on_progress,
             )
         except TranslationError:
+            _require_source_unchanged(source, source_facts.sha256)
             raise
         except Exception as error:
+            _require_source_unchanged(source, source_facts.sha256)
             raise TranslationError(f"PDF translation core failed: {_describe(error)}") from error
+
+        _require_source_unchanged(source, source_facts.sha256)
+        runtime_after = _require_core()
+        if runtime_after != core_identity:
+            raise TranslationError("Bundled PDF core identity changed during the run")
 
         # Nothing was translatable, so the engine produced a copy of the source
         # with no translated text in it. Handing that over as a finished
@@ -533,29 +708,38 @@ def translate_pdf(
         image_only = tuple(sorted(report.image_only_pages))
         if destination is None:
             return Translation(
-                None,
-                untranslated,
-                report.reasons,
-                image_only,
-                report.total_segments,
-                report.translated_segments,
-                report.preserved_segments,
-                report.unresolved_segments,
-                confidentiality_markers,
-                report.unique_translation_units,
-                report.cache_hits,
-                report.provider_requests,
-                report.handoff_table_hits,
-                report.handoff_misses,
-                report.translation_seconds,
-                report.prepare_seconds,
-                report.layout_seconds,
-                report.render_seconds,
-                report.total_seconds,
-                report.input_bytes,
-                report.output_bytes,
-                report.output_font_references,
-                report.unique_output_font_objects,
+                path=None,
+                untranslated=untranslated,
+                reasons=report.reasons,
+                image_only_pages=image_only,
+                total_segments=report.total_segments,
+                translated_segments=report.translated_segments,
+                preserved_segments=report.preserved_segments,
+                unresolved_segments=report.unresolved_segments,
+                confidentiality_markers=confidentiality_markers,
+                unique_translation_units=report.unique_translation_units,
+                cache_hits=report.cache_hits,
+                provider_requests=report.provider_requests,
+                handoff_table_hits=report.handoff_table_hits,
+                handoff_misses=report.handoff_misses,
+                translation_seconds=report.translation_seconds,
+                prepare_seconds=report.prepare_seconds,
+                layout_seconds=report.layout_seconds,
+                render_seconds=report.render_seconds,
+                total_seconds=report.total_seconds,
+                input_bytes=report.input_bytes,
+                output_bytes=report.output_bytes,
+                output_font_references=report.output_font_references,
+                unique_output_font_objects=report.unique_output_font_objects,
+                execution_backend=EXECUTION_BACKEND,
+                core_version=core_identity.version,
+                ruleset=core_identity.ruleset,
+                source_file=source,
+                source_sha256=source_facts.sha256,
+                source_page_count=source_facts.page_count,
+                engine=engine,
+                source_language=source_language,
+                target_language=target_language,
             )
 
         generated = temp_output / f"{source.stem}-mono.pdf"
@@ -566,37 +750,102 @@ def translate_pdf(
                 raise TranslationError(f"Engine did not produce one translated PDF; found: {names}")
             generated = candidates[0]
 
+        candidate_facts = _pdf_facts(generated, role="generated candidate")
+        _validate_candidate(source_facts, candidate_facts, expected_page_ids)
+
+        # The structural gates above are fatal. Layout warnings remain diagnostic,
+        # but the validator itself must complete before an artifact can be final.
+        try:
+            from pdf2zh.layout_qa import run_layout_qa
+
+            layout_qa = run_layout_qa(source, generated, selected_pages)
+            expected_pages_checked = (
+                source_facts.page_count if selected_pages is None else len(selected_pages)
+            )
+            if layout_qa.pages_checked != expected_pages_checked:
+                raise RuntimeError(
+                    "layout validator checked "
+                    f"{layout_qa.pages_checked}/{expected_pages_checked} requested pages"
+                )
+            if layout_qa.warnings:
+                logger.warning(
+                    "Post-render layout QA found %d warning(s) across %d page(s) in %.2fs",
+                    len(layout_qa.warnings),
+                    layout_qa.pages_checked,
+                    layout_qa.elapsed_seconds,
+                )
+                for warning in layout_qa.warnings[:20]:
+                    logger.warning(
+                        "Layout QA %s page %d bbox=%s: %s",
+                        warning.kind,
+                        warning.page,
+                        tuple(round(value, 2) for value in warning.bbox),
+                        warning.detail,
+                    )
+        except Exception as error:
+            raise TranslationError(
+                f"Native pre-publish validator failed: {_describe(error)}"
+            ) from error
+
         staged = destination_dir / f".{destination.name}.tmp"
         try:
             shutil.copyfile(generated, staged)
+            staged_sha256 = _sha256(staged)
+            if staged_sha256 != candidate_facts.sha256:
+                raise TranslationError(
+                    "Staged PDF hash does not match the validated generated candidate"
+                )
             staged.replace(destination)
         finally:
             staged.unlink(missing_ok=True)
 
+        final_sha256 = _sha256(destination)
+        if final_sha256 != candidate_facts.sha256:
+            raise TranslationError(
+                "Final PDF hash does not match the validated generated candidate"
+            )
+
     return Translation(
-        destination,
-        untranslated,
-        report.reasons,
-        image_only,
-        report.total_segments,
-        report.translated_segments,
-        report.preserved_segments,
-        report.unresolved_segments,
-        confidentiality_markers,
-        report.unique_translation_units,
-        report.cache_hits,
-        report.provider_requests,
-        report.handoff_table_hits,
-        report.handoff_misses,
-        report.translation_seconds,
-        report.prepare_seconds,
-        report.layout_seconds,
-        report.render_seconds,
-        report.total_seconds,
-        report.input_bytes,
-        report.output_bytes,
-        report.output_font_references,
-        report.unique_output_font_objects,
+        path=destination,
+        untranslated=untranslated,
+        reasons=report.reasons,
+        image_only_pages=image_only,
+        total_segments=report.total_segments,
+        translated_segments=report.translated_segments,
+        preserved_segments=report.preserved_segments,
+        unresolved_segments=report.unresolved_segments,
+        confidentiality_markers=confidentiality_markers,
+        unique_translation_units=report.unique_translation_units,
+        cache_hits=report.cache_hits,
+        provider_requests=report.provider_requests,
+        handoff_table_hits=report.handoff_table_hits,
+        handoff_misses=report.handoff_misses,
+        translation_seconds=report.translation_seconds,
+        prepare_seconds=report.prepare_seconds,
+        layout_seconds=report.layout_seconds,
+        render_seconds=report.render_seconds,
+        total_seconds=report.total_seconds,
+        input_bytes=report.input_bytes,
+        output_bytes=report.output_bytes,
+        output_font_references=report.output_font_references,
+        unique_output_font_objects=report.unique_output_font_objects,
+        execution_backend=EXECUTION_BACKEND,
+        core_version=core_identity.version,
+        ruleset=core_identity.ruleset,
+        source_file=source,
+        source_sha256=source_facts.sha256,
+        output_file=destination,
+        output_sha256=final_sha256,
+        source_page_count=source_facts.page_count,
+        output_page_count=candidate_facts.page_count,
+        page_geometry_match=_same_geometry(
+            source_facts.geometry, candidate_facts.geometry
+        ),
+        page_mapping_match=candidate_facts.page_ids == expected_page_ids,
+        engine=engine,
+        source_language=source_language,
+        target_language=target_language,
+        native_validator_status="PASS",
     )
 
 
@@ -635,6 +884,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if result.path is not None:
         print(f"Translated PDF: {result.path}")
+        print(
+            "Artifact provenance: "
+            + json.dumps(
+                {
+                    "execution_backend": result.execution_backend,
+                    "core_version": result.core_version,
+                    "ruleset": result.ruleset,
+                    "source_file": str(result.source_file),
+                    "source_sha256": result.source_sha256,
+                    "output_file": str(result.output_file),
+                    "output_sha256": result.output_sha256,
+                    "source_page_count": result.source_page_count,
+                    "output_page_count": result.output_page_count,
+                    "page_geometry_match": result.page_geometry_match,
+                    "page_mapping_match": result.page_mapping_match,
+                    "engine": result.engine,
+                    "source_language": result.source_language,
+                    "target_language": result.target_language,
+                    "native_validator_status": result.native_validator_status,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
     if result.image_only_pages:
         numbers = ", ".join(str(page + 1) for page in result.image_only_pages)
         print(

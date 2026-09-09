@@ -12,6 +12,10 @@ The bundled core translates ordinary text while retaining document structures wh
   are copied directly without model work. Substantial exact boilerplate can be
   deduplicated; short context-sensitive labels stay separate and bypass
   persistent cache reuse.
+- Handoff also keeps substantial Korean occurrences separate when they contain
+  a reviewed ambiguous Korean term or non-identifier English text. Clear
+  register/code-only content and all English-only behavior retain existing
+  dedup and cache rules.
 - A small set of common automation terms may pass through when the whole
   segment is exactly that term. After recognized technical tokens are removed,
   any remaining alphabetic content requires translation regardless of case,
@@ -29,16 +33,32 @@ The bundled core translates ordinary text while retaining document structures wh
 - Each reliable cell is reflowed within its own bounds while the source grid, fills, and borders remain unchanged.
 - When a dense cell is shrunk vertically, its line spacing is recomputed from the final font size so the last line cannot spill into the next row.
 - Cell translations may shrink to half the source font size. If text still cannot fit, that cell remains in the source language and the result is reported as partial.
-- Tables without a reliable cell grid remain fully protected.
+- Tables without a reliable cell grid retain their source geometry. Upright
+  extractable English, Korean, or Chinese prose can translate at its original
+  line anchor, with a local fit region limited by neighboring text, strokes and
+  image edges. The same policy applies to extractable figure labels and
+  translatable header/footer text; raster text remains untouched.
 
 ## Numbered-page structures
 
-- Table-of-contents detection covers headings, dot leaders, box-drawing leaders, wide spacing, em/en spaces, standalone page numbers, Roman numerals, and pages dominated by text-number endings.
+- Table-of-contents detection covers headings, dot leaders, box-drawing leaders,
+  wide spacing, em/en spaces, standalone page numbers, Roman numerals, and pages
+  dominated by text-number endings. Natural-language headings and entry text
+  translate at fixed line anchors; section numbers, leaders, and locators remain
+  exact.
 - Index detection covers an `Index` heading and term-to-page-number rows.
-- Nomenclature, notation, symbol, abbreviation, and glossary pages preserve alternating symbol-definition structures.
-- Reference and bibliography pages preserve numbered, bracketed, author-year, DOI, ISBN, ISSN, and URL-heavy citation structures.
+  Natural-language terms translate while page locators and technical-only terms
+  remain exact.
+- Nomenclature, notation, symbol, abbreviation, and glossary pages preserve each
+  symbol or abbreviation while translating an extractable natural-language
+  definition.
+- Reference and bibliography pages translate natural-language headings. Citation
+  numbering, author/year identity, DOI, ISBN, ISSN, URLs, and citation records
+  covered by the explicit citation policy are allowed preserves.
 
-These classifications preserve the complete page layout instead of reflowing numbers into translated prose.
+These classifications preserve the complete page layout and fixed line bounds;
+they do not blanket-preserve extractable natural-language text or reflow
+structural data into prose. A translation that cannot fit is unresolved.
 
 ## Vietnamese typesetting
 
@@ -94,4 +114,9 @@ These classifications preserve the complete page layout instead of reflowing num
 
 ## Known limits
 
-Text inside an unmatched table or protected figure can remain in the source language. Complex embedded fonts, malformed content streams, or inaccurate layout-model classifications can also require manual review. Treat any substantial untranslated passage or visual defect as a partial result.
+Raster text inside figures and tables remains outside scope because the core has
+no OCR. Extractable prose in protected regions can still remain unresolved when
+fixed anchor bounds cannot fit the translation. Complex embedded fonts,
+malformed content streams, or inaccurate layout-model classifications can also
+require manual review. Treat any unresolved extractable prose, substantial
+untranslated passage, or visual defect as a partial result.

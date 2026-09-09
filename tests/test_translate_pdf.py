@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import tempfile
 from collections import Counter
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import pymupdf
 
 from pdf2zh.high_level import TranslationReport, validate_segment_accounting
 from scripts import translate_pdf
@@ -59,7 +62,11 @@ class TranslatePdfTests(unittest.TestCase):
         self.temp_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_directory.name).resolve()
         self.source = self.root / "guide.pdf"
-        self.source.write_bytes(b"%PDF-1.7\nsource")
+        document = pymupdf.open()
+        page = document.new_page(width=300, height=400)
+        page.insert_text((36, 72), "source")
+        document.save(self.source)
+        document.close()
         self.output = self.root / "output"
 
     def tearDown(self) -> None:
@@ -67,9 +74,14 @@ class TranslatePdfTests(unittest.TestCase):
 
     @staticmethod
     def _engine_side_effect(source, temp_output, *_args):
-        (Path(temp_output) / f"{Path(source).stem}-mono.pdf").write_bytes(
-            b"%PDF-1.7\ntranslated"
-        )
+        candidate = Path(temp_output) / f"{Path(source).stem}-mono.pdf"
+        shutil.copyfile(source, candidate)
+        with pymupdf.open(candidate) as document:
+            for page, identity in zip(document, _args[6]["page_identity"]):
+                document.xref_set_key(
+                    page.xref, translate_pdf.PAGE_ID_KEY, f"({identity})"
+                )
+            document.saveIncr()
         # The real runner hands back what the core could not translate, and why.
         return TranslationReport(translatable_segments=12)
 
@@ -82,10 +94,13 @@ class TranslatePdfTests(unittest.TestCase):
 
         self.assertEqual(result.path, self.output / "guide-vi.pdf")
         self.assertEqual(result.untranslated, 0)
-        self.assertEqual(result.path.read_bytes(), b"%PDF-1.7\ntranslated")
-        run.assert_called_once_with(
-            self.source, mock.ANY, "vi", "auto", None, translate_pdf.DEFAULT_THREADS, False, "google", {}, None
-        )
+        self.assertTrue(result.path.read_bytes().startswith(b"%PDF-"))
+        self.assertEqual(Path(run.call_args.args[0]), self.source)
+        self.assertEqual(run.call_args.args[2:8], (
+            "vi", "auto", None, translate_pdf.DEFAULT_THREADS, False, "google"
+        ))
+        self.assertEqual(len(run.call_args.args[8]["page_identity"]), 1)
+        self.assertIsNone(run.call_args.args[9])
 
     @mock.patch.object(translate_pdf, "_require_core")
     @mock.patch.object(translate_pdf, "_run_engine")
@@ -163,7 +178,7 @@ class TranslatePdfTests(unittest.TestCase):
 
     def test_reports_segments_the_engine_could_not_translate(self):
         def partial(source, temp_output, *_args):
-            (Path(temp_output) / f"{Path(source).stem}-mono.pdf").write_bytes(b"%PDF-1.7\n")
+            self._engine_side_effect(source, temp_output, *_args)
             return TranslationReport(
                 failures=["a"] * 7,
                 reasons=Counter({"ConnectionError": 7}),
@@ -203,7 +218,7 @@ class TranslatePdfTests(unittest.TestCase):
 
     def test_reports_image_only_pages_of_a_mixed_document(self):
         def mixed(source, temp_output, *_args):
-            (Path(temp_output) / f"{Path(source).stem}-mono.pdf").write_bytes(b"%PDF")
+            self._engine_side_effect(source, temp_output, *_args)
             return TranslationReport(image_only_pages={2, 6}, translatable_segments=30)
 
         with (

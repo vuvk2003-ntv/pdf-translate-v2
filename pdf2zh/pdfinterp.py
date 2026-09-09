@@ -107,10 +107,11 @@ HARMLESS_EXTGSTATE_VALUES = ("None", "Identity", "Default")
 def extgstate_is_safe(state: Dict[Any, Any]) -> bool:
     """Whether replaying this graphics state can only affect how colour mixes.
 
-    Overprint and blend mode belong to the text and have to travel with it.
-    A soft mask, a transfer function or partial alpha do not: replaying one in
-    front of the translation could leave the page blank, and a page that reads
-    as empty is worse than one whose black is a shade off.
+    Overprint, blend mode, and nonzero alpha belong to the text and have to
+    travel with it.  In particular, diagonal audit stamps are intentionally
+    translucent; dropping their ExtGState turns a faint timestamp into opaque
+    black.  A soft mask, transfer function, or zero alpha can still conceal the
+    replacement completely and is therefore not replayed.
     """
     for key in CONCEALING_EXTGSTATE_KEYS:
         value = resolve1(state.get(key))
@@ -125,7 +126,8 @@ def extgstate_is_safe(state: Dict[Any, Any]) -> bool:
     for key in ("ca", "CA"):
         value = resolve1(state.get(key, 1))
         try:
-            if float(value) < 1:
+            alpha = float(value)
+            if not math.isfinite(alpha) or alpha <= 0 or alpha > 1:
                 return False
         except (TypeError, ValueError):
             return False

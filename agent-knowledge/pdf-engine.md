@@ -12,6 +12,15 @@
    safe translations.
 5. `pdf2zh/pdfinterp.py` retains source graphics while replacing selected text.
 
+Before a final rebuild, the runner gives the bundled core a deterministic
+identity for each source page. The core attaches those values to the native page
+dictionaries, and the mono path must retain them in the same order. The runner
+checks source SHA-256, runtime identity, page count, size, rotation, page order,
+and successful layout-QA execution against the temporary candidate. Only a
+validated candidate is copied to a same-directory staged file, hash-checked, and
+atomically promoted. Partial page selection still retains the full document
+topology and page-identity sequence.
+
 Handoff extraction is followed by `scripts/prepare_handoff.py`. It groups at
 most 30 segments / 12,000 source characters, carries identity through every
 batch, includes an optional confirmed terminology map once per batch, and
@@ -47,12 +56,25 @@ come from the onnxruntime session, so nothing imports `onnx` directly.
 - Technical identifiers, numeric literals, engineering units/ranges, network
   addresses, paths/URLs, document/standard IDs, versions, generic placeholders,
   structural tags, and literal ON/OFF states are validated before caching.
+- Reviewed proper names use exact ASCII-aware boundaries and leftmost-longest
+  matching. Mixed prose reaches the provider with fresh non-colliding safe tags;
+  exact spans are restored and occurrence counts are checked before caching.
+  Explicit document terminology overrides this default preservation.
 - Token-only labels and executable PLC/robot blocks are filtered before
   translation. Substantial exact repeats may share work; ambiguous short labels
   bypass deduplication and persistent cache reuse.
 - Tables translate per reliable cell only when the model region and
   `PyMuPDF.find_tables()` overlap by at least 50%. Grid, fill, and border
-  operators remain source content. Unreliable tables stay protected.
+  operators remain source content. In unmatched tables, figures, and protected
+  header/footer regions, upright extractable English, Korean, or Chinese prose
+  may use its source-line anchor, bounded by nearby text, strokes and image
+  edges. This does not reconstruct cells or move graphics; ordinary fitting and
+  fallback protections still apply.
+- TOC, index, nomenclature, and reference classifications keep fixed source-line
+  geometry rather than freezing the page. Natural-language headings, entries,
+  terms, and definitions remain translation eligible; section numbers, leaders,
+  locators, symbols, technical tokens, and citation identity data remain exact.
+  A fixed-region fit failure is unresolved rather than translated.
 - Quarter-turn text uses logical baseline orientation. Reflected matrices used
   with negative font sizes are normalized before classification.
 - Symbol/Wingdings private-use bullets remain source glyphs in their embedded

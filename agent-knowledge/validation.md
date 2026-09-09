@@ -14,6 +14,10 @@ This is Tier A and must not call a live translation provider. Tier B semantic
 cases live in `tests/semantic_benchmark_cases.jsonl`; follow
 `tests/SEMANTIC_BENCHMARK.md` and report them separately from CI.
 
+Proper-name regression tests use mock providers. Require exact boundary and
+occurrence behavior, mixed-prose translation, standalone bypass, terminology
+precedence, Handoff rejection/acceptance, and cache revision isolation.
+
 `git diff --check` must be clean. Run `app/gui.py --smoke-test`; after packaging,
 run the packaged executable with `--smoke-test` and require exit code 0.
 
@@ -41,6 +45,17 @@ Keep source and output hashes/paths separate. For every delivered PDF:
 5. Confirm formulas, technical identifiers, URLs, figures, borders, bullets,
    bold/italic runs, and page numbers remain legible and correctly placed.
 6. Report every fallback segment or materially untranslated region as partial.
+7. For protected regions and structural pages, verify extractable prose is
+   translated or unresolved while immutable metadata, TOC/index locators,
+   nomenclature symbols, citation identity, and raster-only text are explicitly
+   preserved. Confirm each recovered source occurrence renders once within its
+   original fixed region.
+
+Production-boundary tests must also simulate native-core failure, source mutation,
+wrong public engine values, page-count/size/rotation changes, reversed page order,
+validator failure, staged-byte corruption, and failed replacement of an existing
+destination. Every structural case must raise before atomic promotion; ordinary
+layout warnings remain diagnostic when the validator itself completes.
 
 Use `tmp/pdfs/` for render/diagnostic intermediates and `output/pdf/` for final
 PDFs. Never overwrite a source or an existing user output without explicit

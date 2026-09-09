@@ -11,6 +11,7 @@ from pdf2zh.converter import (
     is_translatable_segment,
     needs_model_translation,
 )
+from pdf2zh.high_level import table_cluster_render_bounds
 from pdf2zh.rules import (
     BULLET_CHARACTERS,
     classify_preserved_page,
@@ -20,14 +21,23 @@ from pdf2zh.rules import (
     is_formula_font,
     is_scanned_page,
     line_height_for_language,
-    page_has_image,
     matching_table_cells,
     min_line_height_for_language,
+    page_has_image,
     should_translate_table_cell,
+    upright_table_words,
 )
 
 
 class PreservationRuleTests(unittest.TestCase):
+    def test_table_cluster_render_region_uses_the_full_cell_height(self):
+        # The cluster already owns a safe horizontal slice of the detected
+        # cell. Its vertical bounds are the cell, rather than the text fragment.
+        self.assertEqual(
+            table_cluster_render_bounds((10, 20, 110, 60), 200),
+            (12.0, 141.0, 108.0, 179.0),
+        )
+
     def test_token_only_segments_are_filtered_before_translation(self):
         for value in (
             "D100",
@@ -190,6 +200,20 @@ class PreservationRuleTests(unittest.TestCase):
                 self.assertFalse(should_translate_table_cell(value))
         self.assertTrue(should_translate_table_cell("Tension member"))
         self.assertTrue(should_translate_table_cell("Lá»›p phá»§ máº·t dÆ°á»›i"))
+        self.assertTrue(should_translate_table_cell("세부 항목"))
+
+    def test_rotated_watermark_words_do_not_enter_table_cells(self):
+        words = [
+            (10, 10, 30, 20, "Header", 0, 0, 0),
+            (10, 10, 130, 120, "Broken", 0, 0, 1),
+            (20, 20, 120, 120, "2025-09-19", 1, 0, 0),
+        ]
+        blocks = [
+            {"type": 0, "lines": [{"dir": (1.0, 0.0), "bbox": (8, 8, 32, 22)}]},
+            {"type": 1},
+            {"type": 0, "lines": [{"dir": (0.707, -0.707)}]},
+        ]
+        self.assertEqual(upright_table_words(words, blocks), [words[0]])
 
     def test_table_parameter_value_and_unit_keep_separate_cells(self):
         table = SimpleNamespace(

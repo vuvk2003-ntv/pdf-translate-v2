@@ -3,12 +3,114 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
 # Bump when classifier/validation semantics change; old cache entries stay on disk.
-TRANSLATION_RULES_VERSION = "code4life-translation-v2"
+TRANSLATION_RULES_VERSION = "code4life-translation-v3"
+
+# Reviewed, exact source aliases only. Adding or changing an entry also requires
+# a translation-rules revision so an older cache cannot bypass the new invariant.
+VERIFIED_PROPER_NAMES = ("Inovance Technology",)
+_STYLE_TAG_PATTERN = re.compile(r"</?s[123]>", re.IGNORECASE)
+_ASCII_NAME_CHARACTER = r"A-Za-z0-9_"
+
+
+@dataclass(frozen=True)
+class ProperNameSpan:
+    start: int
+    end: int
+    name: str
+
+
+class VerifiedProperNameError(ValueError):
+    """Raised when a reviewed proper-name span is lost, changed, or invented."""
+
+
+def find_verified_proper_names(
+    text: str,
+    names: Iterable[str] = VERIFIED_PROPER_NAMES,
+) -> tuple[ProperNameSpan, ...]:
+    """Return leftmost-longest, non-overlapping, exact reviewed name spans."""
+    candidates: list[ProperNameSpan] = []
+    reviewed = tuple(dict.fromkeys(name for name in names if name))
+    for name in reviewed:
+        pattern = re.compile(
+            rf"(?<![{_ASCII_NAME_CHARACTER}]){re.escape(name)}"
+            rf"(?![{_ASCII_NAME_CHARACTER}])"
+        )
+        candidates.extend(
+            ProperNameSpan(match.start(), match.end(), name)
+            for match in pattern.finditer(text)
+        )
+    candidates.sort(key=lambda span: (span.start, -(span.end - span.start), span.name))
+    selected: list[ProperNameSpan] = []
+    cursor = -1
+    for candidate in candidates:
+        if candidate.start < cursor:
+            continue
+        selected.append(candidate)
+        cursor = candidate.end
+    return tuple(selected)
+
+
+def protected_verified_proper_names(
+    text: str,
+    terminology: Mapping[str, str] | None = None,
+) -> tuple[ProperNameSpan, ...]:
+    """Return reviewed spans whose exact alias has no document override."""
+    overrides = terminology or {}
+    return tuple(
+        span
+        for span in find_verified_proper_names(text)
+        if span.name not in overrides
+    )
+
+
+def is_standalone_verified_proper_name(
+    text: str,
+    terminology: Mapping[str, str] | None = None,
+) -> bool:
+    """Whether visible content is only reviewed names and harmless punctuation."""
+    spans = protected_verified_proper_names(text, terminology)
+    if not spans:
+        return False
+    remainder: list[str] = []
+    cursor = 0
+    for span in spans:
+        remainder.append(text[cursor : span.start])
+        cursor = span.end
+    remainder.append(text[cursor:])
+    visible_remainder = _STYLE_TAG_PATTERN.sub("", "".join(remainder))
+    return all(
+        character.isspace() or unicodedata.category(character).startswith("P")
+        for character in visible_remainder
+    )
+
+
+def validate_verified_proper_names(
+    source: str,
+    target: str,
+    terminology: Mapping[str, str] | None = None,
+) -> None:
+    """Require exact occurrence counts unless document terminology overrides an alias."""
+    overrides = terminology or {}
+    active_names = tuple(name for name in VERIFIED_PROPER_NAMES if name not in overrides)
+    source_counts = Counter(
+        span.name for span in find_verified_proper_names(source, active_names)
+    )
+    target_counts = Counter(
+        span.name for span in find_verified_proper_names(target, active_names)
+    )
+    for name in active_names:
+        if source_counts[name] == target_counts[name]:
+            continue
+        raise VerifiedProperNameError(
+            f"verified proper-name span {name!r} occurrence count changed "
+            f"from {source_counts[name]} to {target_counts[name]}"
+        )
 
 
 @dataclass(frozen=True)
@@ -280,6 +382,203 @@ _COMPILED_SEMANTIC_CUES = tuple(
     for name, src, dst in _SEMANTIC_CUES
 )
 _ORDER_PATTERN = re.compile(r"\b(before|after|trước khi|sau khi|trước|sau)\b", re.IGNORECASE)
+_HANGUL_PATTERN = re.compile(r"[\uac00-\ud7a3]")
+_KOREAN_AMBIGUOUS_TERM_PATTERN = re.compile(r"검수|시운전|대응|공용화")
+_ASCII_WORD_PATTERN = re.compile(r"(?<!\w)[A-Za-z][A-Za-z0-9]*(?:[ /&.-]+[A-Za-z0-9]+)*(?!\w)")
+_KOREAN_NEED_PATTERN = re.compile(
+    r"(?<![가-힣])필요(?:함|하다|합니다|한|가|는)?(?=$|[^가-힣])"
+)
+_KOREAN_MANDATORY_PATTERN = re.compile(
+    r"(?<![가-힣])(?:반드시|필수(?:임|입니다|인|가|는)?)(?=$|[^가-힣])|"
+    r"(?:해야|하여야)\s*(?:함|한다)(?=$|[^가-힣])"
+)
+_KOREAN_RECOMMENDED_PATTERN = re.compile(
+    r"(?<![가-힣])(?:권장|권고)(?:함|하다|합니다|한다|됨|됩니다)?(?=$|[^가-힣])"
+)
+_KOREAN_POSSIBLE_PATTERN = re.compile(
+    r"(?<![가-힣])가능(?:함|하다|합니다|한)?(?=$|[^가-힣])|"
+    r"할\s*수\s*있음(?=$|[^가-힣])"
+)
+_KOREAN_IMPOSSIBLE_PATTERN = re.compile(
+    r"(?<![가-힣])불가(?:함|하다|합니다|한)?(?=$|[^가-힣])|"
+    r"할\s*수\s*없음(?=$|[^가-힣])"
+)
+_KOREAN_CONDITION_PATTERN = re.compile(
+    r"(?<![가-힣])경우(?:에|에는|가|엔)?(?=$|[^가-힣])"
+)
+_KOREAN_RECOMMENDED_TARGET = re.compile(
+    r"\b(?:nên|khuyến nghị|khuyến cáo)\b", re.IGNORECASE
+)
+_KOREAN_SEMANTIC_CUES = (
+    (
+        "need",
+        _KOREAN_NEED_PATTERN,
+        re.compile(r"\b(?:cần|cần thiết|yêu cầu)\b", re.IGNORECASE),
+    ),
+    (
+        "mandatory",
+        _KOREAN_MANDATORY_PATTERN,
+        re.compile(r"\b(?:phải|bắt buộc|nhất thiết)\b", re.IGNORECASE),
+    ),
+    (
+        "recommended",
+        _KOREAN_RECOMMENDED_PATTERN,
+        _KOREAN_RECOMMENDED_TARGET,
+    ),
+    (
+        "prohibition",
+        re.compile(
+            r"(?<![가-힣])금지(?:됨|입니다|함)?(?=$|[^가-힣])|"
+            r"하지\s*(?:마십시오|말\s*것)"
+        ),
+        re.compile(r"\b(?:không|cấm|đừng)\b", re.IGNORECASE),
+    ),
+    (
+        "possible",
+        _KOREAN_POSSIBLE_PATTERN,
+        re.compile(r"\b(?:có thể|được phép|khả thi)\b", re.IGNORECASE),
+    ),
+    (
+        "impossible",
+        _KOREAN_IMPOSSIBLE_PATTERN,
+        re.compile(r"\b(?:không thể|không được phép|bất khả thi)\b", re.IGNORECASE),
+    ),
+    (
+        "condition",
+        _KOREAN_CONDITION_PATTERN,
+        re.compile(r"\b(?:nếu|khi|trong trường hợp)\b", re.IGNORECASE),
+    ),
+    (
+        "first",
+        re.compile(r"(?<![가-힣])먼저(?![가-힣])"),
+        re.compile(r"\b(?:trước tiên|đầu tiên|trước)\b", re.IGNORECASE),
+    ),
+)
+_KOREAN_AFFIRMATIVE_CUES = frozenset({"need", "mandatory", "recommended", "possible"})
+_VIETNAMESE_NEGATION_PREFIX = re.compile(
+    r"\bkhông(?:\s+\w+){0,2}\s*$", re.IGNORECASE
+)
+_KOREAN_TEMPORAL_PATTERN = re.compile(r"(?<![가-힣])(이전|이후|전|후)(?![가-힣])")
+_KOREAN_ACTION_ANCHOR_PATTERN = re.compile(
+    r"검수|시운전|완료|검사|확인|작성|설정|변경|운전|가동|누르|시작|종료|복귀|점검"
+)
+_KOREAN_ALWAYS_PROTECTED_ENGLISH_TERMS = (
+    "Servo Motor",
+    "SCARA Robot",
+    "Interlock",
+)
+_KOREAN_CONTEXTUAL_ENGLISH_TERMS = (
+    ("Manual", re.compile(r"검수|작성|문서|항목|내용|준비|참조|확인")),
+    ("Utility", re.compile(r"공사|설비|장비|공장|배관|전원|공급|연결|시공|현장")),
+    ("Qualification", re.compile(r"설비|장비|공정|수행|검증|인증|평가")),
+)
+_KOREAN_UI_WORD_PATTERN = re.compile(r"(?<!\w)(Start|Save|Reset)(?=\s*버튼)")
+_KOREAN_QUOTED_UI_PATTERN = re.compile(
+    r'["“]([A-Za-z][A-Za-z0-9 _./:&()+-]{0,79})["”]\s*(?:항목|메뉴)'
+)
+_KOREAN_ACRONYM_PATTERN = re.compile(r"(?<!\w)[A-Z]{2,8}(?:/[A-Z0-9]{1,8})?(?!\w)")
+_KOREAN_RANGE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.])[-+]?(?:\d+(?:\.\d+)?)\s*(?:±|–|-|~|～)\s*"
+    r"[-+]?(?:\d+(?:\.\d+)?)(?![A-Za-z0-9_]|\.\d)"
+)
+
+
+def contains_hangul(text: str) -> bool:
+    return _HANGUL_PATTERN.search(TAG_PATTERN.sub("", text)) is not None
+
+
+def is_context_sensitive_korean(text: str) -> bool:
+    """Identify the narrow Korean subset that must not share source-only context."""
+    visible = TAG_PATTERN.sub("", text)
+    if not contains_hangul(visible):
+        return False
+    english_remainder = TECHNICAL_IDENTIFIER_PATTERN.sub("", visible)
+    english_remainder = POLARITY_PATTERN.sub("", english_remainder)
+    return bool(
+        _KOREAN_AMBIGUOUS_TERM_PATTERN.search(visible)
+        or _ASCII_WORD_PATTERN.search(english_remainder)
+    )
+
+
+def _literal_ascii_count(text: str, term: str) -> int:
+    return len(re.findall(rf"(?<!\w){re.escape(term)}(?!\w)", text))
+
+
+def validate_korean_english_spans(
+    source: str,
+    translated: str,
+    terminology: Mapping[str, str] | None = None,
+) -> None:
+    """Preserve a small reviewed set of English terms and explicit Korean UI labels."""
+    if not contains_hangul(source):
+        return
+    terminology = terminology or {}
+    protected: list[str] = []
+    for term in _KOREAN_ALWAYS_PROTECTED_ENGLISH_TERMS:
+        if term not in terminology and _literal_ascii_count(source, term):
+            protected.extend([term] * _literal_ascii_count(source, term))
+    for term, context_pattern in _KOREAN_CONTEXTUAL_ENGLISH_TERMS:
+        if (
+            term not in terminology
+            and context_pattern.search(source)
+            and _literal_ascii_count(source, term)
+        ):
+            protected.extend([term] * _literal_ascii_count(source, term))
+    protected.extend(match[1] for match in _KOREAN_UI_WORD_PATTERN.finditer(source))
+    protected.extend(match[1] for match in _KOREAN_QUOTED_UI_PATTERN.finditer(source))
+    protected.extend(match[0] for match in _KOREAN_ACRONYM_PATTERN.finditer(source))
+    required = Counter(protected)
+    missing = tuple(
+        term
+        for term, count in required.items()
+        for _ in range(max(0, count - _literal_ascii_count(translated, term)))
+    )
+    if missing:
+        raise TechnicalInvariantError(
+            [InvariantDifference("Korean technical English spans", missing, ())]
+        )
+
+
+def _korean_temporal_relation(text: str) -> str | None:
+    cleaned = TAG_PATTERN.sub("", text)
+    matches = list(_KOREAN_TEMPORAL_PATTERN.finditer(cleaned))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    left, right = cleaned[:match.start()], cleaned[match.end():]
+
+    def has_anchor(value: str) -> bool:
+        return bool(
+            _KOREAN_ACTION_ANCHOR_PATTERN.search(value)
+            or TECHNICAL_IDENTIFIER_PATTERN.search(value)
+            or POLARITY_PATTERN.search(value)
+        )
+
+    if not left.strip() or not right.strip() or not has_anchor(left) or not has_anchor(right):
+        return None
+    return "before" if match[1] in {"전", "이전"} else "after"
+
+
+def _vietnamese_temporal_relation(text: str) -> str | None:
+    matches = list(_ORDER_PATTERN.finditer(text))
+    if len(matches) != 1:
+        return None
+    return "before" if matches[0][0].casefold().startswith("trước") else "after"
+
+
+def _canonical_korean_ranges(text: str) -> list[str]:
+    return [re.sub(r"\s*(?:–|-|~|～)\s*", "–", match[0]) for match in _KOREAN_RANGE_PATTERN.finditer(text)]
+
+
+def _has_korean_target_cue(name: str, pattern: re.Pattern[str], text: str) -> bool:
+    """Require positive Korean modalities to remain positive in Vietnamese."""
+    for match in pattern.finditer(text):
+        if name not in _KOREAN_AFFIRMATIVE_CUES:
+            return True
+        prefix = text[max(0, match.start() - 40):match.start()]
+        if not _VIETNAMESE_NEGATION_PREFIX.search(prefix):
+            return True
+    return False
 
 
 def _anchored_order(text: str) -> tuple[str, str] | None:
@@ -314,11 +613,32 @@ def validate_lightweight_semantics(source: str, translated: str, target_language
     if target_language != "vi":
         return
     source, translated = TAG_PATTERN.sub("", source), TAG_PATTERN.sub("", translated)
-    differences = [
+    korean_source = contains_hangul(source)
+    differences = [] if korean_source else [
         InvariantDifference(f"semantic {name}", (name,), ())
         for name, source_pattern, target_pattern in _COMPILED_SEMANTIC_CUES
         if source_pattern.search(source) and not target_pattern.search(translated)
     ]
+    if korean_source:
+        differences.extend(
+            InvariantDifference(f"semantic Korean {name}", (name,), ())
+            for name, source_pattern, target_pattern in _KOREAN_SEMANTIC_CUES
+            if source_pattern.search(source)
+            and not _has_korean_target_cue(name, target_pattern, translated)
+        )
+        source_relation = _korean_temporal_relation(source)
+        if source_relation and _vietnamese_temporal_relation(translated) != source_relation:
+            differences.append(
+                InvariantDifference("semantic Korean order", (source_relation,), ())
+            )
+        if (
+            re.search(r"대응.*(?<!불)필요", source)
+            and not re.search(r"담당|책임", source)
+            and re.search(r"chịu\s+trách\s+nhiệm|người\s+phụ\s+trách|trách\s+nhiệm", translated, re.IGNORECASE)
+        ):
+            differences.append(
+                InvariantDifference("semantic Korean unsupported responsibility", (), ("responsibility",))
+            )
     source_order, target_order = _anchored_order(source), _anchored_order(translated)
     if source_order and target_order and source_order != target_order:
         differences.append(InvariantDifference("semantic order", source_order, target_order))
@@ -330,8 +650,12 @@ def validate_technical_invariants(source: str, translated: str) -> None:
     """Reject changed, removed, duplicated, or invented deterministic tokens."""
     differences: list[InvariantDifference] = _association_differences(source, translated)
     for category, extractor in TOKEN_CHECKS:
-        source_tokens = Counter(extractor(source))
-        translated_tokens = Counter(extractor(translated))
+        if category == "engineering ranges" and contains_hangul(source):
+            source_tokens = Counter(_canonical_korean_ranges(source))
+            translated_tokens = Counter(_canonical_korean_ranges(translated))
+        else:
+            source_tokens = Counter(extractor(source))
+            translated_tokens = Counter(extractor(translated))
         if source_tokens == translated_tokens:
             continue
         differences.append(

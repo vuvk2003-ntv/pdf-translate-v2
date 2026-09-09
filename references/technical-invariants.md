@@ -16,6 +16,13 @@ Executable PLC/robot instruction tokens are also immutable. Value/unit spacing
 is normalized for comparison, so `2350mm` and `2350 mm` are equivalent while a
 changed value, sign, or unit is rejected.
 
+Verified proper names come from a small reviewed registry. Matching is exact,
+case-sensitive, boundary-safe, and leftmost-longest. A standalone reviewed name
+is preserved locally. In mixed prose, only matching spans are hidden behind
+fresh safe tags, restored byte-for-byte, and checked for equal source/target
+occurrence counts before cache acceptance. A confirmed document terminology
+entry for that exact alias overrides default preservation.
+
 Explicit adjacent assignments to recognized identifiers, numbered parameters,
 and named axes are compared by object/value association when both source and
 target use supported forms (including reordered clauses). This is not a full
@@ -28,6 +35,11 @@ Before/after direction is compared only when both actions have distinct stable
 technical anchors. These lightweight guards feed the existing targeted retry;
 they do not prove all negation scope, paraphrases, or action semantics.
 
+Korean-only checks additionally preserve supported `필요`/`필수`,
+`권장`/`권고`, `가능`/`불가`, `경우`, and anchored `전`/`후` distinctions.
+Known technical English and Korean-marked UI labels are exact unless the
+confirmed terminology map explicitly supplies a different rendering.
+
 ## Conflict resolution
 
 Apply one order only:
@@ -38,8 +50,9 @@ Apply one order only:
 4. Preserve semantic polarity: negation, prohibition, `ON`/`OFF`, enable/disable.
 5. Preserve requirement strength and temporal/conditional relationships.
 6. Apply confirmed document-specific terminology.
-7. Apply confirmed vendor/domain terminology.
-8. Produce natural Vietnamese.
+7. Preserve reviewed proper names without a document-specific override.
+8. Apply confirmed vendor/domain terminology.
+9. Produce natural Vietnamese.
 
 Natural phrasing never overrides an earlier item. A validator rejection leaves
 the source segment in place and records it as unresolved; it must not be called

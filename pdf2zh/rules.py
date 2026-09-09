@@ -19,6 +19,24 @@ MATH_OPERATOR_PATTERN = re.compile(
     r"[=≤≥≈≠±×÷·∑∫√∞∝+*/^]"
 )
 PROSE_WORD_PATTERN = re.compile(r"[a-z]{3,}")
+CJK_PROSE_PATTERN = re.compile(
+    r"[\uac00-\ud7a3\u3400-\u9fff]{2,}|(?:[A-Za-z]{2,}|\d+)[\uac00-\ud7a3]+"
+)
+COMMON_STANDALONE_TECHNICAL_TERM_PATTERN = re.compile(
+    r"(?:PLC|HMI|Servo|Servo\s+Motor|Encoder|Interlock|JOG|Servo\s+ON|"
+    r"SCARA\s+Robot|Linear\s+Motor|Buffer\s+C/V|Pick\s*&\s*Place|"
+    r"BCR|(?:2D\s+)?CCD|FFU|PCW|Utility|Check\s+Sheet|Spare\s+Parts|C/V)",
+    re.IGNORECASE,
+)
+IMMUTABLE_METADATA_PATTERNS = (
+    re.compile(r"\b[A-Z]{2,}(?:-[A-Z0-9]+){2,}\b"),
+    re.compile(r"\bRev\.\s*:?\s*\d+(?:\.\d+)+\b", re.IGNORECASE),
+    re.compile(r"\b\d{1,4}\s*/\s*\d{1,4}\b"),
+    re.compile(r"\b(?:19|20)\d{2}[.-]\s*\d{1,2}[.-]\s*\d{1,2}\b"),
+    re.compile(r"\b(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\b"),
+    re.compile(r"\b[A-Z]{2,}[A-Z0-9]*\d{2,}\b"),
+    re.compile(r"CONFIDENTIAL(?:\s+LG\s+Display\s+Co\.,?\s+Ltd)?(?:\s+\d{4})?", re.IGNORECASE),
+)
 MATH_FUNCTION_PATTERN = re.compile(
     r"(?<![A-Za-z])(?:sin|cos|tan|cot|sec|csc|log|ln|exp|min|max|lim|det|mod)(?![A-Za-z])",
     re.IGNORECASE,
@@ -165,6 +183,7 @@ def formula_regions(
             compact
             and MATH_OPERATOR_PATTERN.search(compact)
             and PROSE_WORD_PATTERN.search(prose_candidate) is None
+            and CJK_PROSE_PATTERN.search(prose_candidate) is None
         ):
             protected.append(bounds)
 
@@ -218,6 +237,195 @@ def formula_regions(
     return protected
 
 
+def anchored_translatable_lines(
+    blocks: Iterable[Mapping[str, Any]],
+) -> list[TableTextCluster]:
+    """Extract upright natural-language anchors from protected regions.
+
+    A figure or unmatched outer table column can contain ordinary PDF text.
+    Its line rectangle is a usable local region even when no full grid exists.
+    Keep each line independent and use the shared EN/KO/ZH semantic classifier:
+    no figure-wide reflow, guessed cells, or language-specific eligibility.
+    """
+    result: list[TableTextCluster] = []
+    for block in blocks:
+        for line in block.get("lines", ()):
+            direction = line.get("dir", (1.0, 0.0))
+            if (
+                abs(float(direction[0]) - 1.0) > 0.01
+                or abs(float(direction[1])) > 0.01
+            ):
+                continue
+            text = "".join(str(span.get("text", "")) for span in line.get("spans", ()))
+            bounds = _rect(line.get("bbox", ()))
+            if bounds is None or not should_translate_table_cell(text):
+                continue
+            result.append(TableTextCluster(bounds, text, ()))
+    return result
+
+
+_STRUCTURAL_LEADER_PATTERN = re.compile(
+    r"(?:\.{2,}|[\u2024\u2025\u2026\u2500-\u257f\ufffd\x08]{2,})"
+)
+_STRUCTURAL_LOCATOR_PATTERN = re.compile(
+    r"(?:\d{1,4}|[ivxlcdm]+)[,;:.-]?", re.IGNORECASE
+)
+_STRUCTURAL_SECTION_PATTERN = re.compile(
+    r"(?:\d+(?:\.\d+)*|[ivxlcdm]+)[.)]?", re.IGNORECASE
+)
+_CITATION_LINE_PATTERN = re.compile(
+    r"(?:^\s*(?:\[\d{1,3}\]|\d{1,3}\.\s|[A-Z][a-z]+,?\s.*\(\d{4}\))|"
+    r"(?:DOI|ISBN|ISSN)\b|https?://)",
+    re.IGNORECASE,
+)
+
+
+def _word_bounds(words: Sequence[Sequence[Any]]) -> tuple[float, float, float, float]:
+    return (
+        min(float(word[0]) for word in words),
+        min(float(word[1]) for word in words),
+        max(float(word[2]) for word in words),
+        max(float(word[3]) for word in words),
+    )
+
+
+def structural_page_text_clusters(
+    words: Iterable[Sequence[Any]],
+    kind: str,
+) -> list[TableTextCluster]:
+    """Select prose within a structural page while leaving identity data fixed.
+
+    Each result stays on its source line. TOC/index leaders and locators,
+    nomenclature symbols, and complete citation lines never enter the result.
+    Mixed prose such as ``D100 Parameters`` remains one unit so existing
+    technical invariants can preserve the identifier while translating prose.
+    """
+    grouped: dict[tuple[int, int], list[Sequence[Any]]] = {}
+    for word in words:
+        if len(word) < 5:
+            continue
+        block_number = int(word[5]) if len(word) > 5 else 0
+        line_number = int(word[6]) if len(word) > 6 else 0
+        grouped.setdefault((block_number, line_number), []).append(word)
+
+    result: list[TableTextCluster] = []
+    for key in sorted(grouped):
+        line_words = sorted(
+            grouped[key], key=lambda word: int(word[7]) if len(word) > 7 else float(word[0])
+        )
+        line_text = " ".join(str(word[4]) for word in line_words)
+        if kind == "REFERENCES" and _CITATION_LINE_PATTERN.search(line_text):
+            continue
+
+        start, end = 0, len(line_words)
+        if kind == "TOC" and end > 1 and _STRUCTURAL_SECTION_PATTERN.fullmatch(
+            str(line_words[0][4])
+        ):
+            start = 1
+        if kind in {"TOC", "INDEX"}:
+            for index in range(start, end):
+                if _STRUCTURAL_LEADER_PATTERN.fullmatch(str(line_words[index][4])):
+                    end = index
+                    break
+            else:
+                while end > start and _STRUCTURAL_LOCATOR_PATTERN.fullmatch(
+                    str(line_words[end - 1][4])
+                ):
+                    end -= 1
+        elif kind == "NOMENCLATURE" and end - start > 1:
+            first = str(line_words[0][4])
+            if not should_translate_table_cell(first):
+                start = 1
+
+        selected = line_words[start:end]
+        selected_text = " ".join(str(word[4]) for word in selected)
+        if not selected or not should_translate_table_cell(selected_text):
+            continue
+        result.append(
+            TableTextCluster(_word_bounds(selected), selected_text, tuple(selected))
+        )
+    return result
+
+
+def immutable_metadata_regions(
+    blocks: Iterable[Mapping[str, Any]],
+) -> list[TableTextCluster]:
+    """Locate exact metadata values without protecting adjacent Korean labels.
+
+    Raw PyMuPDF dictionary characters let a mixed line such as a Korean date
+    label plus ``2007. 07. 10`` keep only the value immutable. The remaining
+    label can still enter the normal translation path. The patterns describe
+    document metadata syntax; they contain no document-specific values.
+    """
+    result: list[TableTextCluster] = []
+    seen: set[tuple[str, tuple[float, float, float, float]]] = set()
+    for block in blocks:
+        for line in block.get("lines", ()):
+            characters: list[tuple[str, tuple[float, float, float, float]]] = []
+            for span in line.get("spans", ()):
+                for character in span.get("chars", ()):
+                    bounds = _rect(character.get("bbox", ()))
+                    text = str(character.get("c", ""))
+                    if bounds is not None and text:
+                        characters.append((text, bounds))
+            if not characters:
+                continue
+            text = "".join(character for character, _bounds in characters)
+            for pattern in IMMUTABLE_METADATA_PATTERNS:
+                for match in pattern.finditer(text):
+                    matched = characters[match.start() : match.end()]
+                    if not matched:
+                        continue
+                    bounds = (
+                        min(value[0] for _character, value in matched),
+                        min(value[1] for _character, value in matched),
+                        max(value[2] for _character, value in matched),
+                        max(value[3] for _character, value in matched),
+                    )
+                    key = (match.group(0), bounds)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    result.append(TableTextCluster(bounds, match.group(0), ()))
+    return result
+
+
+def anchored_prose_bounds(
+    source: Sequence[float], parent: Sequence[float],
+    text_lines: Iterable[Sequence[float]], barriers: Iterable[Sequence[float]],
+) -> tuple[float, float, float, float]:
+    """Borrow only clear local space bounded by existing strokes and neighbors.
+
+    This does not infer a grid. Each existing source line owns the space up to
+    a physical rule or the midpoint of the gap to the next text line. Adjacent
+    translated anchors therefore cannot borrow the same gap.
+    """
+    x0,y0,x1,y1 = source
+    left,top,right,bottom = parent
+    lines = [tuple(r) for r in text_lines if tuple(r) != tuple(source)]
+    strokes = list(barriers)
+    for bx0,by0,bx1,by1 in strokes:
+        if by0 < (y0+y1)/2 < by1 and bx1-bx0 <= 1.5:
+            if bx1 <= x0: left=max(left,bx1+1)
+            if bx0 >= x1: right=min(right,bx0-1)
+    for bx0,by0,bx1,by1 in lines:
+        if min(y1,by1)-max(y0,by0) <= 0.5:
+            continue
+        if bx1 <= x0: left=max(left,(bx1+x0)/2)
+        if bx0 >= x1: right=min(right,(x1+bx0)/2)
+    for bx0,by0,bx1,by1 in strokes:
+        if min(right,bx1)-max(left,bx0) > 1 and by1-by0 <= 1.5:
+            if by1 <= y0: top=max(top,by1+0.5)
+            if by0 >= y1: bottom=min(bottom,by0-0.5)
+    for bx0,by0,bx1,by1 in lines:
+        if min(right,bx1)-max(left,bx0) <= 1:
+            continue
+        if by1 <= y0: top=max(top,(by1+y0)/2)
+        if by0 >= y1: bottom=min(bottom,(y1+by0)/2)
+    # Never shrink the source footprint because a noisy rule touches its ink.
+    return min(left,x0),min(top,y0),max(right,x1),max(bottom,y1)
+
+
 def matching_table_cells(
     model_bounds: Sequence[Any],
     tables: Iterable[Any],
@@ -269,17 +477,25 @@ def matching_table_cells(
 def should_translate_table_cell(text: str) -> bool:
     """Return whether a cell contains natural-language text rather than codes.
 
-    Product identifiers and numeric cells are safer left as original PDF glyphs.
-    Natural-language labels in the supported source documents contain lowercase
-    letters, including Unicode lowercase letters outside English.
+    Product identifiers, numeric cells, formulas, and immutable metadata remain
+    source glyphs. English/Korean/Chinese prose is selected by shared token-role
+    rules rather than by requiring lowercase Latin or Hangul evidence.
     """
     value = " ".join(text.split())
     if not value:
+        return False
+    if COMMON_STANDALONE_TECHNICAL_TERM_PATTERN.fullmatch(value):
+        return False
+    if any(pattern.fullmatch(value) for pattern in IMMUTABLE_METADATA_PATTERNS):
         return False
 
     def natural_token(token: str) -> bool:
         token = token.strip("()[]{}:;,\"'“”")
         letters = "".join(character for character in token if character.isalpha())
+        if re.search(r"[\uac00-\ud7a3]", letters):
+            return True
+        if re.search(r"[\u3400-\u9fff]{2,}", letters):
+            return True
         if token.lower() in {"dry", "wet"}:
             return True
         if token.lower() in {"max", "min"}:
@@ -297,11 +513,53 @@ def should_translate_table_cell(text: str) -> bool:
             or re.search(r"[%._/·]", token)
         ):
             return False
-        if len(letters) <= 3 and letters[:1].isupper():
-            return False
         return any(character.islower() for character in letters)
 
     return any(natural_token(token) for token in value.split())
+
+
+def upright_table_words(
+    words: Iterable[Sequence[Any]], blocks: Iterable[Mapping[str, Any]]
+) -> list[Sequence[Any]]:
+    """Exclude rotated text such as diagonal watermarks from table cells.
+
+    PyMuPDF numbers word blocks across text blocks only, while its dictionary
+    includes image blocks too. Rebuild that text-only index so a rotated line
+    cannot paint its large axis-aligned word box across otherwise separate
+    table cells.
+    """
+    upright_lines: dict[tuple[int, int], tuple[float, float, float, float] | None] = {}
+    text_block_index = 0
+    for block in blocks:
+        if int(block.get("type", 0)) != 0:
+            continue
+        for line_index, line in enumerate(block.get("lines", ())):
+            direction = line.get("dir", (1.0, 0.0))
+            if (
+                isinstance(direction, (tuple, list))
+                and len(direction) == 2
+                and abs(float(direction[0]) - 1.0) <= 0.01
+                and abs(float(direction[1])) <= 0.01
+            ):
+                line_bounds = _rect(line.get("bbox", ()))
+                upright_lines[(text_block_index, line_index)] = line_bounds
+        text_block_index += 1
+    result: list[Sequence[Any]] = []
+    for word in words:
+        if len(word) < 7:
+            result.append(word)
+            continue
+        line_bounds = upright_lines.get((int(word[5]), int(word[6])))
+        if (int(word[5]), int(word[6])) not in upright_lines:
+            continue
+        word_bounds = _rect(word)
+        if line_bounds is not None and word_bounds is not None:
+            lx0, ly0, lx1, ly1 = line_bounds
+            wx0, wy0, wx1, wy1 = word_bounds
+            if wx0 < lx0 - 2 or wy0 < ly0 - 2 or wx1 > lx1 + 2 or wy1 > ly1 + 2:
+                continue
+        result.append(word)
+    return result
 
 
 def cluster_table_words(

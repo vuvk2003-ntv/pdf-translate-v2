@@ -187,7 +187,11 @@ class TerminologyPlumbingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, terms = root / 'test.pdf', root / 'terms.json'
-            source.write_bytes(b'%PDF-1.7\n')
+            import pymupdf
+            document = pymupdf.open()
+            document.new_page(width=300, height=400)
+            document.save(source)
+            document.close()
             terms.write_text(json.dumps({'payload': 'tải trọng'}, ensure_ascii=False), encoding='utf-8')
             with (mock.patch.object(translate_pdf, '_require_core'),
                   mock.patch.object(translate_pdf, '_detect_confidentiality_markers', return_value=()),
@@ -201,7 +205,11 @@ class TerminologyPlumbingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, terms = root / 'test.pdf', root / 'terms.json'
-            source.write_bytes(b'%PDF-1.7\n')
+            import pymupdf
+            document = pymupdf.open()
+            document.new_page(width=300, height=400)
+            document.save(source)
+            document.close()
             terms.write_text('{}', encoding='utf-8')
             with mock.patch.object(translate_pdf, '_require_core'), self.assertRaises(translate_pdf.TranslationError):
                 translate_pdf.translate_pdf(source, None, engine='handoff', emit_segments=terms, terminology=terms)

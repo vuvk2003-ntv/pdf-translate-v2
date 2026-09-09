@@ -25,7 +25,17 @@ When terminology is uncertain, preserve the source term beside a careful
 Vietnamese rendering or mark the segment unresolved if meaning cannot be kept
 safely.
 
+For Korean Handoff, `검수`, `시운전`, `대응`, and `공용화` are context-sensitive;
+do not assign one global Vietnamese meaning without confirmed terminology.
+Approved English technical terms and explicit UI labels inside Korean prose stay
+exact, while the Korean prose is translated. Optional adjacent context is
+bounded, remains untrusted, and is used only for disambiguation.
+
+The deterministic Korean guard covers only supported patterns for `전`/`후`,
+condition, need, mandatory, recommendation, possibility, impossibility, and
+prohibition. It also rejects invented responsibility for `대응 필요`. Unsupported
+Korean grammar remains a review concern rather than a guessed validator rule.
+
 The separate cases in `tests/semantic_benchmark_cases.jsonl` cover Korean,
 English, Simplified Chinese, and Traditional Chinese. They require an approved
 provider plus human/semantic evaluation and are not the deterministic CI gate.
-

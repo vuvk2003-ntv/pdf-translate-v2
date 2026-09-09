@@ -5,7 +5,7 @@ import re
 import threading
 import unicodedata
 from collections import Counter
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from enum import Enum, IntEnum
 from string import Template
 from typing import Dict
@@ -19,13 +19,18 @@ from pdfminer.utils import apply_matrix_pt, mult_matrix
 from pymupdf import Font
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from pdf2zh.invariants import (
+    is_context_sensitive_korean,
+    is_executable_code_line,
+    is_standalone_verified_proper_name,
+)
 from pdf2zh.rules import (
+    COMMON_STANDALONE_TECHNICAL_TERM_PATTERN,
     is_bullet_character,
     is_formula_font,
     line_height_for_language,
     min_line_height_for_language,
 )
-from pdf2zh.invariants import is_executable_code_line
 from pdf2zh.translator import (
     ENGINES,
     BaseTranslator,
@@ -45,7 +50,7 @@ TECHNICAL_ONLY_PATTERN = re.compile(
     r"[A-Z]{1,3}\[\d+\]|(?:AL|ERR|ER|E)[.-]\d+|"
     r"(?:TCP|UDP)/\d{1,5}|"
     r"(?-i:(?=[A-Z0-9][A-Z0-9._/-]{3,})(?=[A-Z0-9._/-]*[A-Z])"
-    r"(?=[A-Z0-9._/-]*\d)[A-Z0-9]+(?:[._/-][A-Z0-9]+)*)|"
+    r"(?=[A-Z0-9._/-]*\d)[A-Z0-9]+(?:[._/-][A-Z0-9]+)*[a-z]?)|"
     r"ISO\s+\d+(?:-\d+)*(?::\d{4})?|"
     r"[-+]?\d+(?:\.\d+)?\s*(?:W|kW|V|A|N|m|mA|MPa|kPa|Pa|mm|cm|"
     r"mm/s|m/s|rpm|kHz|Hz|ms|sec|s|µs|μs|°C|N·m|N\.m|Ω|%)|"
@@ -53,12 +58,6 @@ TECHNICAL_ONLY_PATTERN = re.compile(
     r"sec|s|µs|μs|°C|N·m|N\.m|Ω|%)|"
     r"PLC|I/O|JOG|Servo\s+ON|FOB|CAD|ON|OFF|OK|NG|O|X"
     r")(?![A-Za-z0-9_])",
-    re.IGNORECASE,
-)
-COMMON_STANDALONE_TECHNICAL_TERM_PATTERN = re.compile(
-    r"(?:PLC|HMI|Servo|Servo\s+Motor|Encoder|Interlock|JOG|Servo\s+ON|"
-    r"SCARA\s+Robot|Linear\s+Motor|Buffer\s+C/V|Pick\s*&\s*Place|"
-    r"BCR|(?:2D\s+)?CCD|FFU|PCW|Utility|Check\s+Sheet|Spare\s+Parts|C/V)",
     re.IGNORECASE,
 )
 class TextStyle(IntEnum):
@@ -235,6 +234,21 @@ def output_font_lacks_glyph(text: str, font: Font | None) -> bool:
         return False
 
 
+def is_translatable_source_script_character(text: str) -> bool:
+    """Keep Korean/Chinese source letters eligible if the target font lacks them.
+
+    The output font only needs to draw a successful target translation. Treating
+    source Hangul/Han as unrenderable before translation hid the text from both
+    Google and Handoff. An unresolved segment is replayed with its embedded
+    source font later in the converter.
+    """
+    return any(
+        "\u3400" <= character <= "\u9fff"
+        or "\uac00" <= character <= "\ud7a3"
+        for character in text
+    )
+
+
 # A line that stops well short of its column is the last line of a paragraph.
 # Justified prose reaches the right edge on every line but the last, and even
 # ragged-right prose rarely gives up a quarter of the measure mid-paragraph.
@@ -356,8 +370,13 @@ def strip_style_tags(text: str) -> str:
     return STYLE_TAG_PATTERN.sub("", text)
 
 
-def needs_model_translation(segment: str) -> bool:
+def needs_model_translation(
+    segment: str,
+    terminology: Mapping[str, str] | None = None,
+) -> bool:
     """Conservatively remove code/token-only work before a provider sees it."""
+    if is_standalone_verified_proper_name(segment, terminology):
+        return False
     visible = PLACEHOLDER_ONLY_PATTERN.sub("", strip_style_tags(segment)).strip()
     if not visible:
         return False
@@ -382,7 +401,51 @@ def is_safe_to_deduplicate(segment: str) -> bool:
     )
 
 
-def is_translatable_segment(segment: str, preserved: Iterable[str]) -> bool:
+def should_share_translation(segment: str, service: str) -> bool:
+    """Keep existing sharing except for context-sensitive Korean Handoff units."""
+    return is_safe_to_deduplicate(segment) and not (
+        service == "handoff" and is_context_sensitive_korean(segment)
+    )
+
+
+def bounded_korean_context(
+    segments: Sequence[str],
+    paragraphs: Sequence[object],
+    index: int,
+    *,
+    max_characters: int = 300,
+) -> dict[str, str] | None:
+    """Return at most one safe same-region neighbor as untrusted Handoff context."""
+    source = segments[index]
+    current = paragraphs[index]
+    if not is_context_sensitive_korean(source) or current.layout_bound is not None:
+        return None
+    for neighbor in (index - 1, index + 1):
+        if not 0 <= neighbor < len(segments):
+            continue
+        candidate_paragraph = paragraphs[neighbor]
+        candidate = strip_style_tags(segments[neighbor]).strip()
+        if (
+            candidate_paragraph.layout_bound is not None
+            or candidate_paragraph.cls != current.cls
+            or not candidate
+            or candidate == strip_style_tags(source).strip()
+            or len(candidate) > max_characters
+        ):
+            continue
+        return {
+            "type": "untrusted_context",
+            "kind": "adjacent_segment",
+            "text": candidate,
+        }
+    return None
+
+
+def is_translatable_segment(
+    segment: str,
+    preserved: Iterable[str],
+    terminology: Mapping[str, str] | None = None,
+) -> bool:
     """Whether the translator should actually be asked for this segment.
 
     Preserved runs, blank space, and bare formula placeholders are copied
@@ -396,7 +459,7 @@ def is_translatable_segment(segment: str, preserved: Iterable[str]) -> bool:
     return (
         bool(visible)
         and PLACEHOLDER_ONLY_PATTERN.fullmatch(visible) is None
-        and needs_model_translation(segment)
+        and needs_model_translation(segment, terminology)
     )
 
 
@@ -594,8 +657,11 @@ class Paragraph:
         self.brk: bool = brk
         self.cls: int = int(cls)
         self.layout_bound: tuple[float, float, float, float] | None = None
+        self.source_bound: tuple[float, float, float, float] | None = None
         self.orientation = text_orientation(matrix or (1, 0, 0, 1))
         self.rotated_chars: list[LTChar] = []
+        self.source_characters: list[LTChar] = []
+        self.formula_ids: list[int] = []
         self.open_style = TextStyle.REGULAR
         # Replayed in front of this paragraph's runs. A translation cannot
         # carry a colour change through the translator the way it carries a
@@ -669,6 +735,197 @@ def text_fits_box_at_minimum_size(
 
     occupied_height = size + max(0, lines - 1) * size * 0.8
     return occupied_height <= height + 0.01
+
+
+def _cell_wrap_plan(
+    text: str,
+    first_x: float,
+    left_x: float,
+    right_x: float,
+    size: float,
+    formula_widths: list[float],
+    measure_styled_char: Callable[[str, int, float], float],
+) -> tuple[set[int], int] | None:
+    """Return the renderer's word breaks, refusing a mid-token split."""
+    if min(right_x - first_x, right_x - left_x, size) <= 0:
+        return None
+    style = int(TextStyle.REGULAR)
+    pointer = 0
+    line_count = 1
+    break_positions: set[int] = set()
+    current_x = first_x
+    last_space_pointer = -1
+    last_space_x_after = current_x
+    tolerance = 0.1 * size
+
+    while pointer < len(text):
+        style_tag = STYLE_TAG_PATTERN.match(text, pointer)
+        if style_tag:
+            closing, identifier = style_tag.groups()
+            style = int(TextStyle.REGULAR) if closing else int(identifier)
+            pointer = style_tag.end()
+            continue
+        formula = re.match(r"\{\s*v([\d\s]+)\}", text[pointer:], re.IGNORECASE)
+        if formula:
+            try:
+                identifier = int(formula.group(1).replace(" ", ""))
+                width = formula_widths[identifier]
+            except (IndexError, ValueError):
+                width = 0.0
+            pointer += len(formula.group(0))
+        else:
+            character = text[pointer]
+            if character == "\n":
+                line_count += 1
+                current_x = left_x
+                last_space_pointer = -1
+                last_space_x_after = left_x
+                pointer += 1
+                continue
+            width = measure_styled_char(character, style, size)
+            if character == " ":
+                last_space_pointer = pointer
+                last_space_x_after = current_x + width
+            pointer += 1
+
+        if current_x + width > right_x + tolerance and current_x > left_x + tolerance:
+            if last_space_pointer < 0:
+                return None
+            break_positions.add(last_space_pointer)
+            current_x = left_x + (current_x - last_space_x_after)
+            last_space_pointer = -1
+            last_space_x_after = left_x
+            line_count += 1
+        if current_x + width > right_x + tolerance:
+            return None
+        current_x += width
+    return break_positions, line_count
+
+
+def _wrapped_cell_line_count(
+    text: str,
+    first_width: float,
+    width: float,
+    size: float,
+    formula_widths: list[float],
+    measure_char: Callable[[str, float], float],
+    measure_styled_char: Callable[[str, int, float], float] | None = None,
+) -> int | None:
+    """Measure word-wrapped cell text using the renderer's exact break rules."""
+    styled_measure = measure_styled_char or (
+        lambda character, _style, candidate: measure_char(character, candidate)
+    )
+    plan = _cell_wrap_plan(
+        text,
+        width - first_width,
+        0.0,
+        width,
+        size,
+        formula_widths,
+        styled_measure,
+    )
+    return None if plan is None else plan[1]
+
+
+def largest_fitting_cell_font_size(
+    text: str,
+    first_width: float,
+    width: float,
+    height: float,
+    source_size: float,
+    formula_widths: list[float],
+    measure_char: Callable[[str, float], float],
+    line_height: float,
+    measure_styled_char: Callable[[str, int, float], float] | None = None,
+) -> float | None:
+    """Wrap first, then choose the largest size between 50% and source size."""
+    if min(first_width, width, height, source_size, line_height) <= 0:
+        return None
+
+    def fits(candidate: float) -> bool:
+        lines = _wrapped_cell_line_count(
+            text,
+            first_width,
+            width,
+            candidate,
+            formula_widths,
+            measure_char,
+            measure_styled_char,
+        )
+        return lines is not None and lines * candidate * line_height <= height + 0.01
+
+    minimum = source_size * 0.5
+    if not fits(minimum):
+        return None
+    if fits(source_size):
+        return source_size
+    low, high = minimum, source_size
+    for _attempt in range(12):
+        candidate = (low + high) / 2
+        if fits(candidate):
+            low = candidate
+        else:
+            high = candidate
+    return low
+
+
+def partition_shared_cell_bounds(
+    source_bounds: list[tuple[float, float, float, float]],
+    cell_bound: tuple[float, float, float, float],
+) -> list[tuple[float, float, float, float]]:
+    """Give separate occurrences in one cell non-overlapping vertical slices."""
+    if len(source_bounds) <= 1:
+        return [cell_bound for _bound in source_bounds]
+    ordered = sorted(enumerate(source_bounds), key=lambda item: (item[1][1] + item[1][3]) / 2)
+    bands: list[list[tuple[int, tuple[float, float, float, float]]]] = []
+    for item in ordered:
+        centre = (item[1][1] + item[1][3]) / 2
+        if bands:
+            previous = bands[-1][-1][1]
+            previous_centre = (previous[1] + previous[3]) / 2
+            tolerance = max(item[1][3] - item[1][1], previous[3] - previous[1]) * 0.5
+            if abs(centre - previous_centre) <= tolerance:
+                bands[-1].append(item)
+                continue
+        bands.append([item])
+    centres = [
+        sum((bound[1] + bound[3]) / 2 for _index, bound in band) / len(band)
+        for band in bands
+    ]
+    cuts = [(first + second) / 2 for first, second in zip(centres, centres[1:])]
+    result = [cell_bound for _bound in source_bounds]
+    for position, band in enumerate(bands):
+        vertical_bound = (
+            cell_bound[0],
+            cell_bound[1] if position == 0 else cuts[position - 1],
+            cell_bound[2],
+            cell_bound[3] if position + 1 == len(bands) else cuts[position],
+        )
+        if len(band) == 1:
+            result[band[0][0]] = vertical_bound
+            continue
+        horizontal = sorted(
+            band, key=lambda item: (item[1][0] + item[1][2]) / 2
+        )
+        horizontal_centres = [
+            (bound[0] + bound[2]) / 2 for _index, bound in horizontal
+        ]
+        horizontal_cuts = [
+            (first + second) / 2
+            for first, second in zip(horizontal_centres, horizontal_centres[1:])
+        ]
+        for horizontal_position, (original_index, _bound) in enumerate(horizontal):
+            result[original_index] = (
+                vertical_bound[0]
+                if horizontal_position == 0
+                else horizontal_cuts[horizontal_position - 1],
+                vertical_bound[1],
+                vertical_bound[2]
+                if horizontal_position + 1 == len(horizontal)
+                else horizontal_cuts[horizontal_position],
+                vertical_bound[3],
+            )
+    return result
 
 
 # fmt: off
@@ -827,7 +1084,7 @@ class TranslateConverter(PDFConverterEx):
                 if lacks is None:
                     lacks = output_font_lacks_glyph(char, self.noto)
                     self.unrenderable_characters[char[0]] = lacks
-                if lacks:
+                if lacks and not is_translatable_source_script_character(char):
                     return True
             if self.vfont:
                 if re.match(self.vfont, font):
@@ -893,6 +1150,7 @@ class TranslateConverter(PDFConverterEx):
         def append_formula(index: int, identifier: int) -> None:
             close_style(index)
             sstk[index] += f"{{v{identifier}}}"
+            pstk[index].formula_ids.append(identifier)
 
         def new_paragraph(child: LTChar, cls: int) -> None:
             orientation = text_orientation(child.matrix)
@@ -1050,6 +1308,7 @@ class TranslateConverter(PDFConverterEx):
                     if must_preserve:
                         vstk_size_only = False
                     vstk.append(child)
+                pstk[-1].source_characters.append(child)
                 pstk[-1].x0 = min(pstk[-1].x0, child.x0)
                 pstk[-1].x1 = max(pstk[-1].x1, child.x1)
                 pstk[-1].y0 = min(pstk[-1].y0, child.y0)
@@ -1108,10 +1367,29 @@ class TranslateConverter(PDFConverterEx):
             bound = page_bounds.get(paragraph.cls)
             if bound is None:
                 continue
-            paragraph.x0, paragraph.y0, paragraph.x1, paragraph.y1 = bound
-            if paragraph.orientation == IDENTITY_ORIENTATION:
-                paragraph.x = max(paragraph.x, paragraph.x0)
+            paragraph.source_bound = (
+                paragraph.x0,
+                paragraph.y0,
+                paragraph.x1,
+                paragraph.y1,
+            )
             paragraph.layout_bound = bound
+        paragraphs_by_cell: dict[
+            tuple[float, float, float, float], list[Paragraph]
+        ] = {}
+        for paragraph in pstk:
+            if paragraph.layout_bound is not None:
+                paragraphs_by_cell.setdefault(paragraph.layout_bound, []).append(paragraph)
+        for bound, paragraphs in paragraphs_by_cell.items():
+            source_bounds = [
+                paragraph.source_bound or bound for paragraph in paragraphs
+            ]
+            safe_bounds = partition_shared_cell_bounds(source_bounds, bound)
+            for paragraph, safe_bound in zip(paragraphs, safe_bounds):
+                paragraph.x0, paragraph.y0, paragraph.x1, paragraph.y1 = safe_bound
+                paragraph.layout_bound = safe_bound
+                if paragraph.orientation == IDENTITY_ORIENTATION:
+                    paragraph.x = max(paragraph.x, paragraph.x0)
         log.debug("\n==========[VSTACK]==========\n")
         for id, v in enumerate(var):
             l = max([vch.x1 for vch in v]) - v[0].x0
@@ -1129,26 +1407,36 @@ class TranslateConverter(PDFConverterEx):
             stop=stop_after_attempt(8),
             reraise=True,
         )
-        def request_translation(s: str, identity: str) -> str:
-            return self.translator.translate_with_identity(s, identity)
+        def request_translation(
+            s: str,
+            identity: str,
+            context: dict[str, str] | None,
+        ) -> str:
+            return self.translator.translate_with_identity(s, identity, context=context)
 
-        def translate_segment(s: str, identity: str) -> tuple[str, bool]:
+        def translate_segment(
+            s: str,
+            identity: str,
+            context: dict[str, str] | None,
+        ) -> tuple[str, bool]:
             preferred = preferred_translation(s, self.translator.lang_out)
             if preferred is not None:
                 return preferred, True
             encoded = encode_formula_placeholders(s)
-            translated = request_translation(encoded, identity)
+            translated = request_translation(encoded, identity, context)
             return (
                 restore_formula_placeholders(s, translated),
                 self.translator.has_translation_for_identity(encoded, identity),
             )
 
-        def worker(job: tuple[str, str]) -> tuple[str, str]:
-            s, identity = job
-            if not is_translatable_segment(s, preserved_segments):
+        def worker(job: tuple[str, str, dict[str, str] | None]) -> tuple[str, str]:
+            s, identity, context = job
+            if not is_translatable_segment(
+                s, preserved_segments, self.translator.terminology
+            ):
                 return s, "preserved"
             try:
-                translated, resolved = translate_segment(s, identity)
+                translated, resolved = translate_segment(s, identity, context)
                 if not resolved:
                     self.record_translation_failure(s, "UnresolvedSegmentError")
                     return s, "unresolved"
@@ -1170,20 +1458,34 @@ class TranslateConverter(PDFConverterEx):
         # Counted here rather than inside worker: worker runs on the pool, and
         # "+= 1" from several threads drops updates.
         translatable = sum(
-            1 for s in sstk if is_translatable_segment(s, preserved_segments)
+            1
+            for s in sstk
+            if is_translatable_segment(
+                s, preserved_segments, self.translator.terminology
+            )
         )
         self.translatable_segments += translatable
         self.extracted_segments += len(sstk)
         self.segments_by_page[ltpage.pageid] += translatable
 
         outcomes: list[tuple[str, str] | None] = [None] * len(sstk)
-        jobs: dict[tuple[str, object], tuple[str, list[int], str]] = {}
+        jobs: dict[
+            tuple[str, object],
+            tuple[str, list[int], str, dict[str, str] | None],
+        ] = {}
         for index, source in enumerate(sstk):
-            if not is_translatable_segment(source, preserved_segments):
+            if not is_translatable_segment(
+                source, preserved_segments, self.translator.terminology
+            ):
                 outcomes[index] = (source, "preserved")
                 continue
             key: tuple[str, object]
-            if is_safe_to_deduplicate(source):
+            context = (
+                bounded_korean_context(sstk, pstk, index)
+                if self.translator.name == "handoff"
+                else None
+            )
+            if should_share_translation(source, self.translator.name):
                 key = ("shared", source)
                 identity = segment_identifier(encode_formula_placeholders(source))
             else:
@@ -1193,7 +1495,7 @@ class TranslateConverter(PDFConverterEx):
                     f"page={ltpage.pageid}\0index={index}"
                 )
             if key not in jobs:
-                jobs[key] = (source, [], identity)
+                jobs[key] = (source, [], identity, context)
             jobs[key][1].append(index)
 
         self.unique_translation_units += len(jobs)
@@ -1204,12 +1506,12 @@ class TranslateConverter(PDFConverterEx):
                 executor.map(
                     worker,
                     (
-                        (source, identity)
-                        for source, _indices, identity in jobs.values()
+                        (source, identity, context)
+                        for source, _indices, identity, context in jobs.values()
                     ),
                 )
             )
-        for (_source, indices, _identity), outcome in zip(jobs.values(), job_results):
+        for (_source, indices, _identity, _context), outcome in zip(jobs.values(), job_results):
             for index in indices:
                 outcomes[index] = outcome
         if any(outcome is None for outcome in outcomes):
@@ -1331,6 +1633,52 @@ class TranslateConverter(PDFConverterEx):
         def gen_op_line(x, y, xlen, ylen, linewidth):
             return f"ET q 1 0 0 1 {x:f} {y:f} cm [] 0 d 0 J {linewidth:f} w 0 0 m {xlen:f} {ylen:f} l S Q BT "
 
+        def has_source_script(paragraph: Paragraph) -> bool:
+            return any(
+                is_translatable_source_script_character(character.get_text())
+                for character in paragraph.source_characters
+            )
+
+        def replay_source_paragraph(paragraph: Paragraph) -> list[str]:
+            """Replay unresolved source-script text with its embedded glyphs."""
+            operations: list[str] = []
+            for character in paragraph.source_characters:
+                font_name = self.fontid[character.font]
+                orientation = text_orientation(character.matrix)
+                if orientation in (None, IDENTITY_ORIENTATION):
+                    x = character.x0
+                    y = character.y0
+                    size = character.size
+                else:
+                    x = float(character.matrix[4])
+                    y = float(character.matrix[5])
+                    size = matrix_font_size(character.matrix)
+                operations.append(
+                    gen_op_txt(
+                        font_name,
+                        size,
+                        x,
+                        y,
+                        raw_string(font_name, chr(character.cid)),
+                        TextStyle.REGULAR,
+                        normalised_text_matrix(character.matrix),
+                        getattr(character, "graphic_instruction", ""),
+                    )
+                )
+            for identifier in paragraph.formula_ids:
+                for line in varl[identifier]:
+                    if line.linewidth < 5:
+                        operations.append(
+                            gen_op_line(
+                                line.pts[0][0],
+                                line.pts[0][1],
+                                line.pts[1][0] - line.pts[0][0],
+                                line.pts[1][1] - line.pts[0][1],
+                                line.linewidth,
+                            )
+                        )
+            return operations
+
         def rotated_available_length(paragraph: Paragraph) -> float:
             a, b, _c, _d = paragraph.orientation
             bounds = paragraph.layout_bound or (
@@ -1362,6 +1710,8 @@ class TranslateConverter(PDFConverterEx):
                         self.record_translation_failure(
                             source, "rotated text needs less than 50% font size"
                         )
+                    if has_source_script(paragraph):
+                        return replay_source_paragraph(paragraph)
                     translated = source
                     measured = measure_styled_text(translated, size)
                     ratio = min(1.0, available / measured) if measured else 1.0
@@ -1493,34 +1843,78 @@ class TranslateConverter(PDFConverterEx):
             size: float = pstk[id].size
             brk: bool = pstk[id].brk
 
+            if new == sstk[id] and has_source_script(pstk[id]):
+                ops_list.extend(replay_source_paragraph(pstk[id]))
+                continue
+
             if pstk[id].orientation not in (None, IDENTITY_ORIENTATION):
                 ops_list.extend(render_rotated_text(pstk[id], sstk[id], new))
                 continue
 
+            fitted_cell_translation = False
             if pstk[id].layout_bound is not None and new != sstk[id]:
                 def _cell_measure(character: str, candidate_size: float) -> float:
-                    return max(
-                        output_font(
-                            character,
-                            style,
-                            candidate_size,
-                            record_usage=False,
-                        )[1]
+                    widths = (
+                        output_font(character, style, candidate_size, record_usage=False)[1]
                         for style in self.style_font_names
                     )
+                    return max(widths, default=output_font(
+                        character,
+                        int(TextStyle.REGULAR),
+                        candidate_size,
+                        record_usage=False,
+                    )[1])
 
-                if not text_fits_box_at_minimum_size(
+                # The table detector already supplied the safe horizontal
+                # cluster and full cell height. Start at that region's inset,
+                # wrap there, and only then lower the font size.
+                fitted_size = largest_fitting_cell_font_size(
                     new,
-                    x1 - x0,
-                    height,
+                    max(0.0, x1 - x - 1.0),
+                    max(0.0, x1 - x0 - 1.0),
+                    max(0.0, height - 1.0),
                     size,
                     vlen,
                     _cell_measure,
+                    minimum_line_height,
+                    lambda character, style, candidate_size: output_font(
+                        character, style, candidate_size, record_usage=False
+                    )[1],
+                )
+                full_width_size = largest_fitting_cell_font_size(
+                    new,
+                    max(0.0, x1 - x0 - 1.0),
+                    max(0.0, x1 - x0 - 1.0),
+                    max(0.0, height - 1.0),
+                    size,
+                    vlen,
+                    _cell_measure,
+                    minimum_line_height,
+                    lambda character, style, candidate_size: output_font(
+                        character, style, candidate_size, record_usage=False
+                    )[1],
+                )
+                if full_width_size is not None and (
+                    fitted_size is None or full_width_size > fitted_size * 1.05
                 ):
+                    # A centred/right-aligned source label can leave too little
+                    # room for the target's first word. Move only to the safe
+                    # cell inset when doing so materially raises the fitted size.
+                    x = x0
+                    fitted_size = full_width_size
+                if fitted_size is None:
                     self.record_translation_failure(
                         sstk[id], "table cell cannot fit at 50% font size"
                     )
                     new = sstk[id]
+                else:
+                    size = fitted_size
+                    brk = True
+                    fitted_cell_translation = True
+
+            if new == sstk[id] and has_source_script(pstk[id]):
+                ops_list.extend(replay_source_paragraph(pstk[id]))
+                continue
 
             # Auto-scale text to the footprint of the source. This is also
             # required for a single-line title: without it a longer target
@@ -1570,7 +1964,11 @@ class TranslateConverter(PDFConverterEx):
                         ch, int(measure_style), pstk[id].size
                     )[1]
                     tmp_ptr += 1
-            if total_avail > 0 and total_new_width > total_avail * 1.05:
+            if (
+                not fitted_cell_translation
+                and total_avail > 0
+                and total_new_width > total_avail * 1.05
+            ):
                 ratio = total_avail / total_new_width
                 if not brk and ratio < 0.5 and new != sstk[id]:
                     # Only a translation can fall back; source text has
@@ -1583,60 +1981,82 @@ class TranslateConverter(PDFConverterEx):
                 else:
                     size = pstk[id].size * max(ratio, 0.5)
 
+            if new == sstk[id] and has_source_script(pstk[id]):
+                ops_list.extend(replay_source_paragraph(pstk[id]))
+                continue
+
             # Pre-compute word-boundary line breaks to avoid mid-word splits
             if brk:
                 def _measure_char(c, style):
                     return output_font(c, int(style), size)[1]
 
                 break_positions = set()
-                cur_x = x
-                last_space_ptr = -1
-                last_space_x_after = cur_x
-                p2 = 0
-                wrap_style = TextStyle.REGULAR
-                while p2 < len(new):
-                    style_tag = STYLE_TAG_PATTERN.match(new, p2)
-                    if style_tag:
-                        closing, identifier = style_tag.groups()
-                        wrap_style = (
-                            TextStyle.REGULAR
-                            if closing
-                            else TextStyle(int(identifier))
-                        )
-                        p2 = style_tag.end()
-                        continue
-                    vr2 = re.match(r"\{\s*v([\d\s]+)\}", new[p2:], re.IGNORECASE)
-                    if vr2:
-                        try:
-                            vid_t = int(vr2.group(1).replace(" ", ""))
-                            cw = vlen[vid_t]
-                        except Exception:
-                            cw = 0
-                        if cur_x + cw > x1 + 0.1 * size and cur_x > x0 + 0.1 * size:
-                            if last_space_ptr >= 0:
-                                break_positions.add(last_space_ptr + 1)
-                                cur_x = x0 + (cur_x - last_space_x_after)
-                                last_space_ptr = -1
-                                last_space_x_after = x0
-                        cur_x += cw
-                        p2 += len(vr2.group(0))
-                    else:
-                        ch2 = new[p2]
-                        cw = _measure_char(ch2, wrap_style)
-                        if ch2 == ' ':
-                            last_space_ptr = p2
-                            last_space_x_after = cur_x + cw
-                        if cur_x + cw > x1 + 0.1 * size and cur_x > x0 + 0.1 * size:
-                            if last_space_ptr >= 0:
-                                break_positions.add(last_space_ptr + 1)
-                                cur_x = x0 + (cur_x - last_space_x_after)
-                                last_space_ptr = -1
-                                last_space_x_after = x0
-                        cur_x += cw
-                        p2 += 1
+                if fitted_cell_translation:
+                    plan = _cell_wrap_plan(
+                        new,
+                        x,
+                        x0,
+                        x1,
+                        size,
+                        vlen,
+                        lambda character, style, candidate: output_font(
+                            character, style, candidate
+                        )[1],
+                    )
+                    if plan is not None:
+                        break_positions = plan[0]
+                else:
+                    cur_x = x
+                    last_space_ptr = -1
+                    last_space_x_after = cur_x
+                    p2 = 0
+                    wrap_style = TextStyle.REGULAR
+                    while p2 < len(new):
+                        style_tag = STYLE_TAG_PATTERN.match(new, p2)
+                        if style_tag:
+                            closing, identifier = style_tag.groups()
+                            wrap_style = (
+                                TextStyle.REGULAR
+                                if closing
+                                else TextStyle(int(identifier))
+                            )
+                            p2 = style_tag.end()
+                            continue
+                        vr2 = re.match(r"\{\s*v([\d\s]+)\}", new[p2:], re.IGNORECASE)
+                        if vr2:
+                            try:
+                                vid_t = int(vr2.group(1).replace(" ", ""))
+                                cw = vlen[vid_t]
+                            except Exception:
+                                cw = 0
+                            if cur_x + cw > x1 + 0.1 * size and cur_x > x0 + 0.1 * size:
+                                if last_space_ptr >= 0:
+                                    break_positions.add(last_space_ptr + 1)
+                                    cur_x = x0 + (cur_x - last_space_x_after)
+                                    last_space_ptr = -1
+                                    last_space_x_after = x0
+                            cur_x += cw
+                            p2 += len(vr2.group(0))
+                        else:
+                            ch2 = new[p2]
+                            cw = _measure_char(ch2, wrap_style)
+                            if ch2 == ' ':
+                                last_space_ptr = p2
+                                last_space_x_after = cur_x + cw
+                            if cur_x + cw > x1 + 0.1 * size and cur_x > x0 + 0.1 * size:
+                                if last_space_ptr >= 0:
+                                    break_positions.add(last_space_ptr + 1)
+                                    cur_x = x0 + (cur_x - last_space_x_after)
+                                    last_space_ptr = -1
+                                    last_space_x_after = x0
+                            cur_x += cw
+                            p2 += 1
                 # Replace spaces at break positions with newlines (process in reverse)
                 for bp in sorted(break_positions, reverse=True):
-                    new = new[:bp - 1] + '\n' + new[bp:]
+                    if fitted_cell_translation:
+                        new = new[:bp] + '\n' + new[bp + 1:]
+                    else:
+                        new = new[:bp - 1] + '\n' + new[bp:]
 
             cstk: str = ""
             fcur: str = None
@@ -1886,13 +2306,14 @@ class TranslateConverter(PDFConverterEx):
                                    budget=height - (lidx + 1) * size * line_height)
 
             if pstk[id].layout_bound is not None:
-                y += vertical_shift_to_bounds(
+                cell_shift = vertical_shift_to_bounds(
                     y,
                     ink,
                     offsets,
                     pstk[id].y0 + 0.5,
                     pstk[id].y1 - 0.5,
                 )
+                y += cell_shift
 
             for vals in ops_vals:
                 if vals["type"] == OpType.TEXT:
