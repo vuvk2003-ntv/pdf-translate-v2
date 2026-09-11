@@ -20,7 +20,10 @@ from pdf2zh.invariants import (
     TechnicalInvariantError,
     VerifiedProperNameError,
     contains_hangul,
+    find_document_label_literals,
+    find_windows_path_literals,
     is_standalone_verified_proper_name,
+    protected_korean_ui_labels,
     protected_verified_proper_names,
     validate_korean_english_spans,
     validate_lightweight_semantics,
@@ -45,6 +48,97 @@ SAFE_CACHE_PLACEHOLDER_PATTERN = re.compile(r"\{v\d+\}|</?[bs]\d+>", re.IGNORECA
 class ProperNameMask(NamedTuple):
     identifier: int
     source: str
+
+
+class ProviderLiteralMask(NamedTuple):
+    identifier: int
+    source: str
+    kind: str
+
+
+def mask_provider_literals(
+    text: str,
+    terminology: dict[str, str] | None = None,
+) -> tuple[str, tuple[ProviderLiteralMask, ...]]:
+    """Hide exact names, paths, and syntactic UI labels from a provider."""
+    candidates = [
+        (span.start, span.end, span.name, "verified proper name")
+        for span in protected_verified_proper_names(text, terminology)
+    ]
+    candidates.extend(
+        (span.start, span.end, span.literal, span.kind)
+        for span in find_windows_path_literals(text)
+    )
+    candidates.extend(
+        (span.start, span.end, span.literal, span.kind)
+        for span in find_document_label_literals(text)
+    )
+    candidates.extend(
+        (span.start, span.end, span.literal, span.kind)
+        for span in protected_korean_ui_labels(text, terminology)
+    )
+    candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    selected: list[tuple[int, int, str, str]] = []
+    cursor = -1
+    for candidate in candidates:
+        if candidate[0] < cursor:
+            continue
+        selected.append(candidate)
+        cursor = candidate[1]
+    if not selected:
+        return text, ()
+
+    used_ids = [int(identifier) for identifier in re.findall(r"</?b(\d+)>", text)]
+    next_identifier = max(used_ids, default=-1) + 1
+    pieces: list[str] = []
+    masks: list[ProviderLiteralMask] = []
+    cursor = 0
+    for offset, (start, end, source, kind) in enumerate(selected):
+        identifier = next_identifier + offset
+        pieces.append(text[cursor:start])
+        pieces.append(f"<b{identifier}></b{identifier}>")
+        masks.append(ProviderLiteralMask(identifier, source, kind))
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces), tuple(masks)
+
+
+def restore_provider_literals(
+    translated: str,
+    masks: tuple[ProviderLiteralMask, ...],
+) -> str:
+    """Validate provider placeholders and restore every exact source span."""
+    if not masks:
+        return translated
+    identifiers = "|".join(str(mask.identifier) for mask in masks)
+    tag_pattern = re.compile(rf"</?b(?:{identifiers})>")
+    expected_tags = [
+        tag
+        for mask in masks
+        for tag in (f"<b{mask.identifier}>", f"</b{mask.identifier}>")
+    ]
+    error_type = (
+        VerifiedProperNameError
+        if all(mask.kind == "verified proper name" for mask in masks)
+        else FormulaPlaceholderError
+    )
+    if tag_pattern.findall(translated) != expected_tags:
+        raise error_type(
+            "protected provider placeholders were dropped, duplicated, or reordered"
+        )
+    restored = translated
+    for mask in masks:
+        token = f"<b{mask.identifier}></b{mask.identifier}>"
+        if restored.count(token) != 1:
+            raise error_type(
+                f"protected {mask.kind} placeholder pair is malformed"
+            )
+        restored = restored.replace(token, mask.source, 1)
+    if tag_pattern.search(restored):
+        raise error_type(
+            "protected provider placeholder leaked into translated text"
+        )
+    return restored
 
 
 def mask_verified_proper_names(
@@ -214,11 +308,9 @@ class BaseTranslator:
         with self._metrics_lock:
             self.translation_requests += 1
         try:
-            provider_text, proper_name_masks = mask_verified_proper_names(
-                text, self.terminology
-            )
+            provider_text, literal_masks = mask_provider_literals(text, self.terminology)
             translated = self.do_translate(provider_text)
-            translated = restore_verified_proper_names(translated, proper_name_masks)
+            translated = restore_provider_literals(translated, literal_masks)
         finally:
             elapsed = time.perf_counter() - started
             with self._metrics_lock:

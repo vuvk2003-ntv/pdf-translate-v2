@@ -282,6 +282,41 @@ def line_ends_paragraph(
     return line_end < x0 + width * ratio
 
 
+def layout_class_for_bounds(
+    layout: np.ndarray,
+    bounds: Sequence[float],
+) -> int:
+    """Read a glyph's class from its visual interior instead of its origin.
+
+    Recovered regions are painted from source-line rectangles.  A glyph origin
+    may sit exactly on an integer edge, and a later metadata carve can touch
+    one corner without owning the glyph.  The center is the stable ownership
+    point; nearby interior samples recover from a one-pixel hole while never
+    borrowing a class that merely touches the outside of the glyph.
+    """
+    x0, y0, x1, y1 = (float(value) for value in bounds[:4])
+    height, width = layout.shape
+
+    def value_at(x: float, y: float) -> int:
+        column = int(np.clip(math.floor(x), 0, width - 1))
+        row = int(np.clip(math.floor(y), 0, height - 1))
+        return int(layout[row, column])
+
+    centre = value_at((x0 + x1) / 2, (y0 + y1) / 2)
+    if centre:
+        return centre
+    samples = (
+        value_at(x0 * 0.75 + x1 * 0.25, (y0 + y1) / 2),
+        value_at(x0 * 0.25 + x1 * 0.75, (y0 + y1) / 2),
+        value_at((x0 + x1) / 2, y0 * 0.75 + y1 * 0.25),
+        value_at((x0 + x1) / 2, y0 * 0.25 + y1 * 0.75),
+    )
+    nonzero = [value for value in samples if value]
+    if nonzero:
+        return Counter(nonzero).most_common(1)[0][0]
+    return 0
+
+
 # A subscript or a superscript is a character or two. Anything this long that
 # reads as words is body text that merely happens to be set smaller than what
 # opened its paragraph.
@@ -529,6 +564,17 @@ def should_translate_rotated_text(text: str) -> bool:
     return True
 
 
+def iter_layout_items(container):
+    """Yield page items in content-stream order and retain figure boundaries."""
+    container_id = id(container)
+    for child in container:
+        if isinstance(child, LTFigure):
+            yield from iter_layout_items(child)
+            continue
+        child.source_container_id = container_id
+        yield child
+
+
 class PDFConverterEx(PDFConverter):
     def __init__(
         self,
@@ -536,6 +582,13 @@ class PDFConverterEx(PDFConverter):
     ) -> None:
         PDFConverter.__init__(self, rsrcmgr, None, "utf-8", 1, None)
         self.page_clip: tuple[float, float, float, float] | None = None
+        # Form XObjects may own fonts that are absent from the page resource
+        # dictionary. Page-level atomic fallback needs stable aliases for those
+        # fonts so their original glyph codes can be replayed after the forms'
+        # text operators have been removed.
+        self.source_font_names: dict[object, str] = {}
+        self.source_fonts_by_name: dict[str, object] = {}
+        self.source_font_xrefs_by_page: dict[int, dict[str, int]] = {}
         # One entry per piece of colour state, and a saved stack for q/Q.
         self.graphic_operators: dict[str, str] = {}
         self.graphic_stack: list[dict[str, str]] = []
@@ -591,6 +644,16 @@ class PDFConverterEx(PDFConverter):
         self.graphic_stack = []
         self.cur_item = LTPage(page.pageno, mediabox)
 
+    def register_source_font(self, font: object, objid: int | None) -> None:
+        """Record an indirect source font under a page-safe resource alias."""
+        if objid is None or not isinstance(self.cur_item, (LTPage, LTFigure)):
+            return
+        pageid = int(self.cur_item.pageid)
+        name = f"CodexSrc{objid}"
+        self.source_font_names[font] = name
+        self.source_fonts_by_name[name] = font
+        self.source_font_xrefs_by_page.setdefault(pageid, {})[name] = objid
+
     def end_page(self, page):
         return self.receive_layout(self.cur_item)
 
@@ -600,13 +663,20 @@ class PDFConverterEx(PDFConverter):
         self.cur_item = LTFigure(name, bbox, mult_matrix(matrix, self.ctm))
         self.cur_item.pageid = self._stack[-1].pageid
 
-    def end_figure(self, _: str) -> None:
+    def end_figure(self, _: str) -> str:
+        """Buffer a Form XObject for one page-level translation pass.
+
+        The interpreter still needs an empty replacement stream for the form so
+        its source text is removed before the page-level replacement is drawn.
+        Returning ``None`` serializes the word ``None`` into the PDF stream.
+        """
         self.pop_graphic_state()
         fig = self.cur_item
         assert isinstance(self.cur_item, LTFigure), str(type(self.cur_item))
         self.cur_item = self._stack.pop()
         self.cur_item.add(fig)
-        return self.receive_layout(fig)
+        return ""
+
 
     def render_char(
         self,
@@ -950,6 +1020,7 @@ class TranslateConverter(PDFConverterEx):
         style_fonts: Dict | None = None,
         synthetic_styles: set[int] | None = None,
         class_bounds: Dict | None = None,
+        logical_classes: Dict | None = None,
     ) -> None:
         super().__init__(rsrcmgr)
         self.vfont = vfont
@@ -960,6 +1031,7 @@ class TranslateConverter(PDFConverterEx):
         # Preserve an empty mapping by identity instead of replacing it.
         self.layout_bounds = layout_bounds if layout_bounds is not None else {}
         self.class_bounds = class_bounds if class_bounds is not None else {}
+        self.logical_classes = logical_classes if logical_classes is not None else {}
         self.noto_name = noto_name
         self.noto = noto
         self.style_font_names = style_font_names or {0: noto_name}
@@ -987,9 +1059,13 @@ class TranslateConverter(PDFConverterEx):
         # Exact substantial repeats share one worker result. Ambiguous short
         # labels remain separate so context-sensitive meanings are not merged.
         self.unique_translation_units: int = 0
+        # Number of logical units for which the existing tenacity policy
+        # scheduled at least one additional attempt.
+        self.retry_units: int = 0
         # Accounting uses the converter's actual paragraph segmentation. Every
         # entry in sstk is translated, deliberately preserved, or unresolved.
         self.extracted_segments: int = 0
+        self.logical_unit_char_counts: list[int] = []
         # Pages carrying a raster image, filled in by the caller.
         self.pages_with_images: set[int] = set()
         self.segments_by_page: Counter[int] = Counter()
@@ -1065,6 +1141,7 @@ class TranslateConverter(PDFConverterEx):
         lstk: list[LTLine] = []
         xt: LTChar = None
         xt_cls: int = -1
+        xt_container: int | None = None
         vmax: float = ltpage.width / 4
         page_class_bounds = self.class_bounds.get(ltpage.pageid, {})
         ops: str = ""
@@ -1176,15 +1253,14 @@ class TranslateConverter(PDFConverterEx):
             )
 
         ############################################################
-        for child in ltpage:
+        page_logical_classes = self.logical_classes.get(ltpage.pageid, set())
+        for child in iter_layout_items(ltpage):
             if isinstance(child, LTChar):
                 if is_outside_page(child, self.page_clip):
                     continue
                 cur_v = False
                 layout = self.layout[ltpage.pageid]
-                h, w = layout.shape
-                cx, cy = np.clip(int(child.x0), 0, w - 1), np.clip(int(child.y0), 0, h - 1)
-                cls = layout[cy, cx]
+                cls = layout_class_for_bounds(layout, child.bbox)
                 if is_bullet_character(child.get_text(), child.fontname):
                     cls = 0
                 orientation = text_orientation(child.matrix)
@@ -1247,11 +1323,22 @@ class TranslateConverter(PDFConverterEx):
                         vstk_size_only = True
                 if not vstk:
                     if cls == xt_cls:
+                        crosses_container = (
+                            xt_container is not None
+                            and child.source_container_id != xt_container
+                            and int(cls) not in page_logical_classes
+                        )
                         # Force paragraph break for list items: when text wraps back
                         # to left AND there's a significant vertical gap (> 1.5x font size),
                         # it's likely a new list item, not a continuation
-                        if (child.x1 < xt.x0
-                            and abs(child.y0 - xt.y0) > pstk[-1].size * 1.5):
+                        if crosses_container:
+                            close_style(len(sstk) - 1)
+                            new_paragraph(child, cls)
+                        elif (
+                            int(cls) not in page_logical_classes
+                            and child.x1 < xt.x0
+                            and abs(child.y0 - xt.y0) > pstk[-1].size * 1.5
+                        ):
                             close_style(len(sstk) - 1)
                             new_paragraph(child, cls)
                         elif child.x0 > xt.x1 + 1:
@@ -1315,14 +1402,20 @@ class TranslateConverter(PDFConverterEx):
                 pstk[-1].y1 = max(pstk[-1].y1, child.y1)
                 xt = child
                 xt_cls = cls
+                xt_container = child.source_container_id
             elif isinstance(child, LTFigure):
                 pass
             elif isinstance(child, LTLine):
                 layout = self.layout[ltpage.pageid]
-                h, w = layout.shape
-                cx, cy = np.clip(int(child.x0), 0, w - 1), np.clip(int(child.y0), 0, h - 1)
-                cls = layout[cy, cx]
-                if vstk and cls == xt_cls:
+                cls = layout_class_for_bounds(layout, child.bbox)
+                if (
+                    vstk
+                    and cls == xt_cls
+                    and (
+                        child.source_container_id == xt_container
+                        or int(cls) in page_logical_classes
+                    )
+                ):
                     vlstk.append(child)
                 else:
                     lstk.append(child)
@@ -1402,9 +1495,19 @@ class TranslateConverter(PDFConverterEx):
         # Google throttles a long document, so back off instead of hammering it.
         # Roughly two minutes of patience per segment, then give up rather than
         # hang the run forever the way an unbounded retry used to.
+        retried_identities: set[str] = set()
+        retry_identity_lock = threading.Lock()
+
+        def record_retry(retry_state: object) -> None:
+            arguments = getattr(retry_state, "args", ())
+            if len(arguments) > 1:
+                with retry_identity_lock:
+                    retried_identities.add(str(arguments[1]))
+
         @retry(
             wait=wait_exponential(multiplier=1, min=1, max=60),
             stop=stop_after_attempt(8),
+            before_sleep=record_retry,
             reraise=True,
         )
         def request_translation(
@@ -1466,6 +1569,9 @@ class TranslateConverter(PDFConverterEx):
         )
         self.translatable_segments += translatable
         self.extracted_segments += len(sstk)
+        self.logical_unit_char_counts.extend(
+            len(strip_style_tags(source)) for source in sstk
+        )
         self.segments_by_page[ltpage.pageid] += translatable
 
         outcomes: list[tuple[str, str] | None] = [None] * len(sstk)
@@ -1514,6 +1620,7 @@ class TranslateConverter(PDFConverterEx):
         for (_source, indices, _identity, _context), outcome in zip(jobs.values(), job_results):
             for index in indices:
                 outcomes[index] = outcome
+        self.retry_units += len(retried_identities)
         if any(outcome is None for outcome in outcomes):
             raise RuntimeError("translation scheduling lost an extracted segment")
         outcomes = [outcome for outcome in outcomes if outcome is not None]
@@ -1526,10 +1633,12 @@ class TranslateConverter(PDFConverterEx):
             if fcur in self.output_fonts_by_name:
                 font = self.output_fonts_by_name[fcur]
                 return "".join(["%04x" % font.has_glyph(ord(c)) for c in cstk])
-            elif isinstance(self.fontmap[fcur], PDFCIDFont):
+            source_font = self.fontmap.get(fcur, self.source_fonts_by_name.get(fcur))
+            if isinstance(source_font, PDFCIDFont):
                 return "".join(["%04x" % ord(c) for c in cstk])
-            else:
+            if source_font is not None:
                 return "".join(["%02x" % ord(c) for c in cstk])
+            raise KeyError(f"font resource {fcur!r} is unavailable")
 
         def output_font(
             character: str,
@@ -1553,6 +1662,63 @@ class TranslateConverter(PDFConverterEx):
                 return font_name, font.char_lengths(character, size)[0]
             except Exception:
                 return font_name, size * 0.5
+
+        source_cmap_codes: dict[object, dict[int, bytes]] = {}
+
+        def source_character_encoding(
+            character: LTChar,
+        ) -> tuple[object, str]:
+            """Encode a source glyph even when it came from a Form resource.
+
+            At end_page the interpreter exposes the page resource map. Fonts
+            private to nested Form XObjects are therefore absent. Use the
+            installed output font for those Unicode characters instead of
+            crashing while composing an atomic unresolved fallback.
+            """
+            source_font = self.source_font_names.get(character.font)
+            if source_font is None:
+                source_font = self.fontid.get(character.font)
+            if source_font is not None:
+                font = character.font
+                if isinstance(font, PDFCIDFont):
+                    cmap_name = str(
+                        getattr(getattr(font, "cmap", None), "attrs", {}).get(
+                            "CMapName", ""
+                        )
+                    ).upper()
+                    if "UTF16" in cmap_name:
+                        return source_font, character.get_text().encode(
+                            "utf-16-be"
+                        ).hex()
+                    if cmap_name.startswith("IDENTITY-"):
+                        return source_font, f"{int(character.cid):04x}"
+
+                    reverse = source_cmap_codes.get(font)
+                    if reverse is None:
+                        reverse = {}
+
+                        def collect_codes(node: dict, prefix: bytes = b"") -> None:
+                            for code, value in node.items():
+                                encoded = prefix + bytes((int(code),))
+                                if isinstance(value, dict):
+                                    collect_codes(value, encoded)
+                                else:
+                                    reverse.setdefault(int(value), encoded)
+
+                        collect_codes(getattr(font.cmap, "code2cid", {}))
+                        source_cmap_codes[font] = reverse
+                    code = reverse.get(int(character.cid))
+                    if code is not None:
+                        return source_font, code.hex()
+                else:
+                    return source_font, f"{int(character.cid):02x}"
+            source_text = character.get_text()
+            replacement_font, _advance = output_font(
+                source_text,
+                int(TextStyle.REGULAR),
+                character.size,
+            )
+            return replacement_font, raw_string(replacement_font, source_text)
 
         def measure_styled_text(text: str, size: float) -> float:
             total = 0.0
@@ -1643,7 +1809,7 @@ class TranslateConverter(PDFConverterEx):
             """Replay unresolved source-script text with its embedded glyphs."""
             operations: list[str] = []
             for character in paragraph.source_characters:
-                font_name = self.fontid[character.font]
+                font_name, encoded = source_character_encoding(character)
                 orientation = text_orientation(character.matrix)
                 if orientation in (None, IDENTITY_ORIENTATION):
                     x = character.x0
@@ -1659,7 +1825,7 @@ class TranslateConverter(PDFConverterEx):
                         size,
                         x,
                         y,
-                        raw_string(font_name, chr(character.cid)),
+                        encoded,
                         TextStyle.REGULAR,
                         normalised_text_matrix(character.matrix),
                         getattr(character, "graphic_instruction", ""),
@@ -1773,18 +1939,18 @@ class TranslateConverter(PDFConverterEx):
                     first = formula_chars[0]
                     first_origin = (float(first.matrix[4]), float(first.matrix[5]))
                     for formula_char in formula_chars:
+                        formula_font, formula_raw = source_character_encoding(
+                            formula_char
+                        )
                         dx = float(formula_char.matrix[4]) - first_origin[0]
                         dy = float(formula_char.matrix[5]) - first_origin[1]
                         operations.append(
                             gen_op_txt(
-                                self.fontid[formula_char.font],
+                                formula_font,
                                 matrix_font_size(formula_char.matrix),
                                 anchor_x + a * cursor + dx,
                                 anchor_y + b * cursor + dy,
-                                raw_string(
-                                    self.fontid[formula_char.font],
-                                    chr(formula_char.cid),
-                                ),
+                                formula_raw,
                                 TextStyle.REGULAR,
                                 normalised_text_matrix(formula_char.matrix),
                                 getattr(formula_char, "graphic_instruction", ""),
@@ -2187,14 +2353,14 @@ class TranslateConverter(PDFConverterEx):
                     if fcur is not None:
                         fix = varf[vid]
                     for vch in var[vid]:
-                        vc = chr(vch.cid)
+                        source_font, source_raw = source_character_encoding(vch)
                         ops_vals.append({
                             "type": OpType.TEXT,
-                            "font": self.fontid[vch.font],
+                            "font": source_font,
                             "size": vch.size,
                             "x": x + vch.x0 - var[vid][0].x0,
                             "dy": fix + vch.y0 - var[vid][0].y0,
-                            "rtxt": raw_string(self.fontid[vch.font], vc),
+                            "rtxt": source_raw,
                             "lidx": lidx,
                             "style": TextStyle.REGULAR,
                             "orientation": normalised_text_matrix(vch.matrix),

@@ -115,6 +115,30 @@ For a batch, process files individually and report progress. A failure on one fi
 
 Handoff extracts translatable segments to JSONL, lets the active agent translate them, then rebuilds the PDF. Warn about token and time cost before starting a large document. For long documents, suggest a representative sample such as `--pages 1-5` first.
 
+Treat every extracted record as one logical source occurrence. A wrapped
+sentence may be stored in several Form XObjects or physical text lines, but it
+must be emitted, translated, validated, and rebuilt as one record. Never
+translate those fragments independently. When no accepted translation exists,
+rebuild the complete source occurrence atomically rather than dropping or
+duplicating one of its lines.
+
+Logical-unit reconstruction is deterministic and precedes cache/provider
+dispatch. Merge fragments only when page, established parent/region identity,
+reading order, geometry, structural role, and linguistic continuation agree.
+Known same-cell identity is strong evidence; known different cells, different
+columns, header/body or footer/body roles, separate callouts, separate bullets,
+and distinct paragraphs are hard boundaries. Unknown identity is never treated
+as same identity from proximity alone. Inline bold/italic differences stay
+inside the sentence through `<s1>`/`<s2>`/`<s3>` markers.
+
+Never merge across pages. Report a real sentence split by a page break as
+`KNOWN CROSS-PAGE CONTINUATION LIMITATION`, and verify that both halves remain
+present and independent. Reconstruction never calls a model and does not alter
+the native renderer. Each merged unit retains its child fragment IDs, page,
+region/cell ownership, source geometry, and a debug merge reason. Retry and
+source fallback operate on that whole unit; the existing batcher may still put
+many independent units in one request.
+
 ### 1. Extract
 
 An output directory is not required during extraction because the pass-one PDF is discarded.
@@ -146,7 +170,11 @@ Keep `segment_id` so mapping does not depend on response order:
 {"segment_id":"stable id from the batch","src":"exact source text","dst":"translated text"}
 ```
 
-Copy each `src` value exactly. Preserve URLs, paths, identifiers, citation markers, and numbers.
+Copy each `src` value exactly. Preserve URLs, Unicode Windows paths, identifiers,
+citation markers, numbers, document-control labels such as `Page No`, and UI
+labels such as quoted button or mode names. Inspect the segment JSONL when a
+source sentence appears clipped: the record must contain the whole logical
+occurrence before translation begins.
 Short labels receive IDs from source, page, and paragraph index. Substantial
 exact repeats intentionally share a source-based ID and translation. Rebuild
 resolves that ID or its validated shared cache entry; a missing occurrence ID
@@ -197,13 +225,23 @@ limited to three total attempts including the initial translation; increment `--
 ```
 
 The command prints segment accounting (`total`, `translated`, `preserved`, and
-`unresolved`), work/cache counts, phase timing, PDF byte sizes, and output-font
-resource counts. `still-missing.jsonl` should be empty after offline validation.
+`unresolved`), reconstruction/conservation counters, merge rejection reasons,
+unit character statistics, work/cache/retry counts, phase timing, PDF byte
+sizes, and output-font resource counts. `still-missing.jsonl` should be empty after offline validation.
 If it is not, report the exact remaining limitation instead of repeatedly
 rebuilding. Never label unresolved as translated.
 
 Extraction and the final rebuild each run the layout pass. Targeted retries use
 only the JSONL validator, so they add no more extraction or render passes.
+
+For a provider-free reconstruction benchmark, run the extraction command with
+`--engine handoff --emit-segments` and no `--output-dir`. This executes the same
+extract → filter → reconstruct path as production and stops at the Handoff
+boundary without a translation provider. Require
+`assigned_candidate_fragments == candidate_fragments`, zero unassigned
+fragments, and zero duplicate assignments. Treat the health thresholds in
+`pdf2zh.logical_units.reconstruction_health_review` as a benchmark/manual-review
+signal only; they never accept or reject a production PDF at runtime.
 
 ## Verify before delivery
 

@@ -12,6 +12,9 @@ from typing import Iterable, Sequence
 
 import pymupdf
 
+from pdf2zh.invariants import find_windows_path_literals
+from pdf2zh.rules import upright_line_bounds
+
 Rect = tuple[float, float, float, float]
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7a3]")
 METADATA_PATTERNS = {
@@ -78,6 +81,13 @@ def classify_cjk_residual(
         return "ALLOWED_PROPER_NAME"
     if normalized in set(official_tokens):
         return "ALLOWED_OFFICIAL_TOKEN"
+    path_spans = find_windows_path_literals(normalized)
+    cjk_offsets = [match.start() for match in CJK_PATTERN.finditer(normalized)]
+    if cjk_offsets and path_spans and all(
+        any(span.start <= offset < span.end for span in path_spans)
+        for offset in cjk_offsets
+    ):
+        return "ALLOWED_TECHNICAL_LITERAL"
     return "UNTRANSLATED_PROSE"
 
 
@@ -110,7 +120,9 @@ def immutable_metadata_occurrences(page: pymupdf.Page) -> list[MetadataOccurrenc
             bbox_value = line.get("bbox", ())
             if not text or len(bbox_value) != 4:
                 continue
-            bbox = tuple(float(value) for value in bbox_value)
+            bbox = upright_line_bounds(line) or tuple(
+                float(value) for value in bbox_value
+            )
             direction = line.get("dir", (1.0, 0.0))
             if not _metadata_zone(bbox, direction, float(page.rect.height)):
                 continue
@@ -165,7 +177,9 @@ def analyze_metadata_page(
             bbox_value = line.get("bbox", ())
             if len(bbox_value) != 4:
                 continue
-            bbox = tuple(float(value) for value in bbox_value)
+            bbox = upright_line_bounds(line) or tuple(
+                float(value) for value in bbox_value
+            )
             direction = line.get("dir", (1.0, 0.0))
             text = "".join(str(span.get("text", "")) for span in line.get("spans", ()))
             if text and _metadata_zone(bbox, direction, float(target_page.rect.height)):
@@ -413,7 +427,11 @@ def _page_spans(page: pymupdf.Page) -> list[SpanGeometry]:
                 continue
             for span in line.get("spans", ()):
                 text = str(span.get("text", ""))
-                bbox = tuple(float(value) for value in span.get("bbox", ()))
+                span_bbox = span.get("bbox", ())
+                bbox = (
+                    upright_line_bounds({"bbox": span_bbox, "spans": [span]})
+                    or tuple(float(value) for value in span_bbox)
+                )
                 size = float(span.get("size", 0))
                 if text.strip() and len(bbox) == 4 and math.isfinite(size) and size > 0:
                     spans.append(SpanGeometry(

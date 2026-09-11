@@ -31,6 +31,20 @@ and after a font change. Render every page after reducing fonts: a clean font
 inventory alone does not prove that the remaining shared xrefs draw on every
 page.
 
+For logical-reconstruction changes, use the production Handoff extraction path
+without `--output-dir` as the provider-free benchmark. Record raw spans,
+candidate/assigned/unassigned/duplicate fragments, logical/provider-bound
+units, merged/singleton counts, every continuation rejection reason, unit
+character statistics, requests, retries, translation time, and total time.
+Candidate assignment must be conserved exactly. Run all eleven fixtures in
+`tests/test_logical_units.py`; any source-confirmed cross-cell, cross-column,
+heading/body, bullet, callout, or paragraph false merge is a hard failure.
+`reconstruction_health_review` may request manual review for suspiciously low
+acceptance or high singleton rates, but is benchmark guidance and must not gate
+arbitrary production PDFs. Cross-page continuations intentionally remain two
+accounted units and must be reported as `KNOWN CROSS-PAGE CONTINUATION
+LIMITATION`.
+
 ## PDF Gate
 
 Keep source and output hashes/paths separate. For every delivered PDF:

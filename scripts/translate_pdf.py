@@ -73,8 +73,30 @@ class Translation(NamedTuple):
     unresolved_segments: int = 0
     confidentiality_markers: tuple[str, ...] = ()
     unique_translation_units: int = 0
+    raw_text_spans: int = 0
+    candidate_fragments: int = 0
+    assigned_candidate_fragments: int = 0
+    unassigned_candidate_fragments: int = 0
+    duplicate_fragment_assignments: int = 0
+    logical_units: int = 0
+    provider_bound_units: int = 0
+    merged_fragment_count: int = 0
+    singleton_unit_count: int = 0
+    continuation_candidate_count: int = 0
+    accepted_merge_count: int = 0
+    rejected_merge_count: int = 0
+    rejected_cross_cell: int = 0
+    rejected_cross_column: int = 0
+    rejected_structural_role: int = 0
+    rejected_page_boundary: int = 0
+    rejected_geometry: int = 0
+    rejected_linguistic_boundary: int = 0
+    average_chars_per_unit: float = 0.0
+    median_chars_per_unit: float = 0.0
+    max_chars_per_unit: int = 0
     cache_hits: int = 0
     provider_requests: int = 0
+    retry_units: int = 0
     handoff_table_hits: int = 0
     handoff_misses: int = 0
     translation_seconds: float = 0.0
@@ -718,8 +740,30 @@ def translate_pdf(
                 unresolved_segments=report.unresolved_segments,
                 confidentiality_markers=confidentiality_markers,
                 unique_translation_units=report.unique_translation_units,
+                raw_text_spans=report.raw_text_spans,
+                candidate_fragments=report.candidate_fragments,
+                assigned_candidate_fragments=report.assigned_candidate_fragments,
+                unassigned_candidate_fragments=report.unassigned_candidate_fragments,
+                duplicate_fragment_assignments=report.duplicate_fragment_assignments,
+                logical_units=report.logical_units,
+                provider_bound_units=report.provider_bound_units,
+                merged_fragment_count=report.merged_fragment_count,
+                singleton_unit_count=report.singleton_unit_count,
+                continuation_candidate_count=report.continuation_candidate_count,
+                accepted_merge_count=report.accepted_merge_count,
+                rejected_merge_count=report.rejected_merge_count,
+                rejected_cross_cell=report.rejected_cross_cell,
+                rejected_cross_column=report.rejected_cross_column,
+                rejected_structural_role=report.rejected_structural_role,
+                rejected_page_boundary=report.rejected_page_boundary,
+                rejected_geometry=report.rejected_geometry,
+                rejected_linguistic_boundary=report.rejected_linguistic_boundary,
+                average_chars_per_unit=report.average_chars_per_unit,
+                median_chars_per_unit=report.median_chars_per_unit,
+                max_chars_per_unit=report.max_chars_per_unit,
                 cache_hits=report.cache_hits,
                 provider_requests=report.provider_requests,
+                retry_units=report.retry_units,
                 handoff_table_hits=report.handoff_table_hits,
                 handoff_misses=report.handoff_misses,
                 translation_seconds=report.translation_seconds,
@@ -816,8 +860,30 @@ def translate_pdf(
         unresolved_segments=report.unresolved_segments,
         confidentiality_markers=confidentiality_markers,
         unique_translation_units=report.unique_translation_units,
+        raw_text_spans=report.raw_text_spans,
+        candidate_fragments=report.candidate_fragments,
+        assigned_candidate_fragments=report.assigned_candidate_fragments,
+        unassigned_candidate_fragments=report.unassigned_candidate_fragments,
+        duplicate_fragment_assignments=report.duplicate_fragment_assignments,
+        logical_units=report.logical_units,
+        provider_bound_units=report.provider_bound_units,
+        merged_fragment_count=report.merged_fragment_count,
+        singleton_unit_count=report.singleton_unit_count,
+        continuation_candidate_count=report.continuation_candidate_count,
+        accepted_merge_count=report.accepted_merge_count,
+        rejected_merge_count=report.rejected_merge_count,
+        rejected_cross_cell=report.rejected_cross_cell,
+        rejected_cross_column=report.rejected_cross_column,
+        rejected_structural_role=report.rejected_structural_role,
+        rejected_page_boundary=report.rejected_page_boundary,
+        rejected_geometry=report.rejected_geometry,
+        rejected_linguistic_boundary=report.rejected_linguistic_boundary,
+        average_chars_per_unit=report.average_chars_per_unit,
+        median_chars_per_unit=report.median_chars_per_unit,
+        max_chars_per_unit=report.max_chars_per_unit,
         cache_hits=report.cache_hits,
         provider_requests=report.provider_requests,
+        retry_units=report.retry_units,
         handoff_table_hits=report.handoff_table_hits,
         handoff_misses=report.handoff_misses,
         translation_seconds=report.translation_seconds,
@@ -932,17 +998,74 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Translation work: "
             f"unique_units={result.unique_translation_units}, "
             f"provider_requests={result.provider_requests}, "
+            f"retry_units={result.retry_units}, "
             f"cache_hits={result.cache_hits}, "
             f"handoff_table_hits={result.handoff_table_hits}, "
             f"handoff_misses={result.handoff_misses}"
         )
         print(
+            "Logical reconstruction: "
+            f"raw_text_spans={result.raw_text_spans}, "
+            f"candidate_fragments={result.candidate_fragments}, "
+            f"assigned_candidate_fragments={result.assigned_candidate_fragments}, "
+            f"unassigned_candidate_fragments={result.unassigned_candidate_fragments}, "
+            f"duplicate_fragment_assignments={result.duplicate_fragment_assignments}, "
+            f"logical_units={result.logical_units}, "
+            f"provider_bound_units={result.provider_bound_units}, "
+            f"merged_fragment_count={result.merged_fragment_count}, "
+            f"singleton_unit_count={result.singleton_unit_count}"
+        )
+        print(
+            "Continuation decisions: "
+            f"continuation_candidate_count={result.continuation_candidate_count}, "
+            f"accepted_merge_count={result.accepted_merge_count}, "
+            f"rejected_merge_count={result.rejected_merge_count}, "
+            f"rejected_cross_cell={result.rejected_cross_cell}, "
+            f"rejected_cross_column={result.rejected_cross_column}, "
+            f"rejected_structural_role={result.rejected_structural_role}, "
+            f"rejected_page_boundary={result.rejected_page_boundary}, "
+            f"rejected_geometry={result.rejected_geometry}, "
+            "rejected_linguistic_boundary="
+            f"{result.rejected_linguistic_boundary}"
+        )
+        print(
+            "Logical unit characters: "
+            f"average_chars_per_unit={result.average_chars_per_unit:.2f}, "
+            f"median_chars_per_unit={result.median_chars_per_unit:.2f}, "
+            f"max_chars_per_unit={result.max_chars_per_unit}"
+        )
+        candidate_merge_rate = (
+            result.continuation_candidate_count / result.raw_text_spans
+            if result.raw_text_spans
+            else 0.0
+        )
+        merge_acceptance_rate = (
+            result.accepted_merge_count / result.continuation_candidate_count
+            if result.continuation_candidate_count
+            else 0.0
+        )
+        singleton_rate = (
+            result.singleton_unit_count / result.logical_units
+            if result.logical_units
+            else 0.0
+        )
+        print(
+            "Reconstruction review rates: "
+            f"candidate_merge_rate={candidate_merge_rate:.4f}, "
+            f"merge_acceptance_rate={merge_acceptance_rate:.4f}, "
+            f"singleton_rate={singleton_rate:.4f}"
+        )
+        print(
+            "KNOWN CROSS-PAGE CONTINUATION LIMITATION: source fragments on "
+            "different pages remain independent logical units"
+        )
+        print(
             "Timing: "
-            f"prepare={result.prepare_seconds:.3f}s, "
-            f"layout={result.layout_seconds:.3f}s, "
-            f"translation={result.translation_seconds:.3f}s, "
-            f"render={result.render_seconds:.3f}s, "
-            f"total={result.total_seconds:.3f}s"
+            f"prepare_seconds={result.prepare_seconds:.3f}, "
+            f"layout_seconds={result.layout_seconds:.3f}, "
+            f"translation_seconds={result.translation_seconds:.3f}, "
+            f"render_seconds={result.render_seconds:.3f}, "
+            f"total_seconds={result.total_seconds:.3f}"
         )
         print(
             "PDF/font resources: "

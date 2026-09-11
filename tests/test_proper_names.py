@@ -247,8 +247,15 @@ class ProperNameGooglePathTests(unittest.TestCase):
         )
         for source, expected in fixtures:
             with self.subTest(source=source):
+                def respond(masked: str, result=expected) -> str:
+                    tokens = re.findall(r"<b\d+></b\d+>", masked)
+                    translated = result.replace(NAME, tokens[0])
+                    if "Start" not in masked and "Start" in result:
+                        translated = translated.replace("Start", tokens[1])
+                    return translated
+
                 translator = MockGoogleTranslator(
-                    lambda masked, result=expected: result.replace(NAME, _proper_token(masked))
+                    respond
                 )
                 self.assertEqual(translator.translate(source), expected)
 
@@ -333,9 +340,9 @@ class ProperNameCacheTests(unittest.TestCase):
         )
 
     def test_rule_revision_moves_old_bad_cache_out_of_namespace(self):
-        self.assertEqual(TRANSLATION_RULES_VERSION, "code4life-translation-v3")
+        self.assertEqual(TRANSLATION_RULES_VERSION, "code4life-translation-v4")
         with mock.patch.object(
-            terminology, "TRANSLATION_RULES_VERSION", "code4life-translation-v2"
+            terminology, "TRANSLATION_RULES_VERSION", "code4life-translation-v3"
         ):
             old = self._translator("Công nghệ đổi mới")
             old.cache.set(MIXED_SOURCE, "Công nghệ đổi mới")

@@ -99,6 +99,40 @@ class KoreanRealWorldRegressionTests(unittest.TestCase):
             terminology={"Manual": "hướng dẫn"},
         )
 
+    def test_syntactic_ui_labels_remain_exact(self):
+        pairs = [
+            (
+                '“ Send HEX ” 를 선택하고 “ File Data ” Panel 을 연다.',
+                'Chọn “ Send HEX ” và mở Panel “ File Data ”.',
+            ),
+            (
+                "Communication Panel에서 Detail Option 화면을 확인한다.",
+                "Kiểm tra màn hình Detail Option trong Communication Panel.",
+            ),
+            (
+                "File Open 버튼을 누르고 Steal Mode 화면을 연다.",
+                "Nhấn nút File Open và mở màn hình Steal Mode.",
+            ),
+        ]
+        for source, target in pairs:
+            with self.subTest(source=source):
+                validate_translation_result(source, target, target_language="vi")
+
+    def test_changed_syntactic_ui_label_is_rejected(self):
+        with self.assertRaises(TechnicalInvariantError):
+            validate_translation_result(
+                '“ Send HEX ” 를 선택한다.',
+                'Chọn “ Gửi HEX ”.',
+                target_language="vi",
+            )
+
+    def test_ordinary_title_case_english_is_not_globally_frozen(self):
+        validate_translation_result(
+            "Industrial Robot 성능을 검토한다.",
+            "Xem xét hiệu suất robot công nghiệp.",
+            target_language="vi",
+        )
+
     def test_mixed_korean_english_still_needs_translation(self):
         for source in (
             "검수 전 Manual 작성",

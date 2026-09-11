@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Any
 
+from pdf2zh.logical_units import (
+    LogicalFragment,
+    ReconstructionMetrics,
+    build_logical_units,
+)
+
 FORMULA_FONT_PATTERN = re.compile(
     r"(CM[^R]|MS.M|XY|MT|BL|RM|EU|LA|RS|LINE|LCIRCLE|TeX-|rsfs|txsy|wasy|"
     r"stmary|.*Mono|.*Code|.*Sym|.*Math|.*Typewriter|Cousine|Consolas|Menlo|"
@@ -25,7 +31,8 @@ CJK_PROSE_PATTERN = re.compile(
 COMMON_STANDALONE_TECHNICAL_TERM_PATTERN = re.compile(
     r"(?:PLC|HMI|Servo|Servo\s+Motor|Encoder|Interlock|JOG|Servo\s+ON|"
     r"SCARA\s+Robot|Linear\s+Motor|Buffer\s+C/V|Pick\s*&\s*Place|"
-    r"BCR|(?:2D\s+)?CCD|FFU|PCW|Utility|Check\s+Sheet|Spare\s+Parts|C/V)",
+    r"BCR|(?:2D\s+)?CCD|FFU|PCW|Utility|Check\s+Sheet|Spare\s+Parts|C/V|"
+    r"Page\s+No\.?)",
     re.IGNORECASE,
 )
 IMMUTABLE_METADATA_PATTERNS = (
@@ -89,6 +96,20 @@ class TableTextCluster:
     bbox: tuple[float, float, float, float]
     text: str
     words: tuple[Sequence[Any], ...]
+    # ``bbox`` is the complete logical occurrence.  ``regions`` are the
+    # physical source lines that own glyphs, so assigning one layout class does
+    # not paint across unrelated material in the whitespace between them.
+    regions: tuple[tuple[float, float, float, float], ...] = ()
+    # A translation may safely use more room than the source words occupied
+    # (for example the gap before a TOC leader).  Keep that fitting region
+    # separate from both source ownership and provenance.
+    render_bbox: tuple[float, float, float, float] | None = None
+    # Used only to distinguish a heading/body role change across physical
+    # lines. Inline weight/slant remains style markup inside one unit.
+    font_size: float | None = None
+    style: int = 0
+    parent_id: Any = None
+    fragment_id: str | None = None
 
 
 def is_formula_font(font_name: str) -> bool:
@@ -141,6 +162,65 @@ def _rect(value: Sequence[Any]) -> tuple[float, float, float, float] | None:
         return tuple(float(item) for item in value[:4])
     except (TypeError, ValueError):
         return None
+
+
+def upright_line_bounds(
+    line: Mapping[str, Any],
+) -> tuple[float, float, float, float] | None:
+    """Return the visual ink band for an upright PyMuPDF text line.
+
+    Some technical manuals embed Hangul as Type 3 glyphs whose declared font
+    box is roughly ten times the actual 11 pt line height.  PyMuPDF then
+    reports a line from the baseline down through several following lines.  If
+    that raw rectangle is painted into the layout map, later anchors overwrite
+    earlier ones and a word can be split into translated and replayed pieces.
+
+    Span origins, font size, ascender and descender still describe the visual
+    baseline correctly.  Use them when the reported rectangle is implausible;
+    retain the native bounds for ordinary fonts.
+    """
+    native = _rect(line.get("bbox", ()))
+    spans = tuple(line.get("spans", ()))
+    if native is None or not spans:
+        return native
+
+    visual: list[tuple[float, float, float, float]] = []
+    for span in spans:
+        bounds = _rect(span.get("bbox", ()))
+        origin = span.get("origin", ())
+        try:
+            size = abs(float(span.get("size", 0.0)))
+            baseline = float(origin[1])
+            ascender = float(span.get("ascender", 0.9))
+            descender = float(span.get("descender", -0.2))
+        except (IndexError, TypeError, ValueError):
+            continue
+        if bounds is None or size <= 0:
+            continue
+        # Broken font metadata occasionally reports extreme ascender values as
+        # well.  These conservative defaults describe the ordinary em box and
+        # still include combining marks after the one-point paint padding.
+        if not 0.4 <= ascender <= 1.5:
+            ascender = 0.9
+        if not -0.6 <= descender <= 0.2:
+            descender = -0.2
+        top = baseline - size * ascender
+        bottom = baseline - size * descender
+        visual.append((bounds[0], min(top, bottom), bounds[2], max(top, bottom)))
+    if not visual:
+        return native
+
+    candidate = (
+        min(rect[0] for rect in visual),
+        min(rect[1] for rect in visual),
+        max(rect[2] for rect in visual),
+        max(rect[3] for rect in visual),
+    )
+    native_height = native[3] - native[1]
+    visual_height = candidate[3] - candidate[1]
+    if visual_height > 0 and native_height > visual_height * 2.5:
+        return candidate
+    return native
 
 
 def _inside_any(
@@ -243,24 +323,141 @@ def anchored_translatable_lines(
     """Extract upright natural-language anchors from protected regions.
 
     A figure or unmatched outer table column can contain ordinary PDF text.
-    Its line rectangle is a usable local region even when no full grid exists.
-    Keep each line independent and use the shared EN/KO/ZH semantic classifier:
-    no figure-wide reflow, guessed cells, or language-specific eligibility.
+    Its visual line rectangle is a usable local region even when no full grid
+    exists.  Physical lines remain separate here; the caller may group nearby
+    lines inside the same protected parent into one logical occurrence.
     """
     result: list[TableTextCluster] = []
-    for block in blocks:
-        for line in block.get("lines", ()):
+    for block_index, block in enumerate(blocks):
+        for line_index, line in enumerate(block.get("lines", ())):
             direction = line.get("dir", (1.0, 0.0))
             if (
                 abs(float(direction[0]) - 1.0) > 0.01
                 or abs(float(direction[1])) > 0.01
             ):
                 continue
-            text = "".join(str(span.get("text", "")) for span in line.get("spans", ()))
-            bounds = _rect(line.get("bbox", ()))
+            spans = tuple(line.get("spans", ()))
+            text = "".join(str(span.get("text", "")) for span in spans)
+            bounds = upright_line_bounds(line)
             if bounds is None or not should_translate_table_cell(text):
                 continue
-            result.append(TableTextCluster(bounds, text, ()))
+            for span_index, span in enumerate(spans):
+                span_text = str(span.get("text", ""))
+                if not span_text:
+                    continue
+                span_bounds = _rect(span.get("bbox", ()))
+                if span_bounds is None:
+                    span_bounds = bounds
+                # Keep the normalized visual line band for pathological Type 3
+                # metadata while retaining the span's horizontal run extent.
+                span_bounds = (span_bounds[0], bounds[1], span_bounds[2], bounds[3])
+                try:
+                    font_size = abs(float(span.get("size", 0.0))) or None
+                except (TypeError, ValueError):
+                    font_size = None
+                flags = int(span.get("flags", 0) or 0)
+                style = (1 if flags & 16 else 0) | (2 if flags & 2 else 0)
+                result.append(
+                    TableTextCluster(
+                        span_bounds,
+                        span_text,
+                        (),
+                        (bounds,),
+                        font_size=font_size,
+                        style=style,
+                        parent_id=("text-block", block_index),
+                        fragment_id=(
+                            f"block-{block_index}-line-{line_index}-span-{span_index}"
+                        ),
+                    )
+                )
+    return result
+
+
+def group_translatable_line_clusters(
+    clusters: Iterable[TableTextCluster],
+    *,
+    barriers: Iterable[Sequence[Any]] = (),
+    page: int = 0,
+    region_id: Any = "established-parent",
+    cell_id: Any = None,
+    column_id: Any = None,
+    paragraph_id: Any = None,
+    callout_id: Any = None,
+    structural_role: str = "body",
+    metrics: ReconstructionMetrics | None = None,
+    fragment_id_prefix: str = "fragment",
+) -> list[TableTextCluster]:
+    """Join conservative source-line wraps into atomic logical occurrences.
+
+    The input must already be limited to one protected parent (one callout,
+    figure, or unmatched table region).  Geometry, punctuation and list
+    boundaries all have to agree before two physical lines are joined.  This
+    keeps neighboring labels independent while repairing manuals whose PDF
+    producer emits every visual line as a separate text block.
+    """
+    source = list(clusters)
+    by_id: dict[str, TableTextCluster] = {}
+    fragments: list[LogicalFragment] = []
+    for index, cluster in enumerate(source):
+        identifier = f"{fragment_id_prefix}-{cluster.fragment_id or index}"
+        by_id[identifier] = cluster
+        fragments.append(
+            LogicalFragment(
+                fragment_id=identifier,
+                text=cluster.text,
+                page=page,
+                bbox=cluster.bbox,
+                reading_order=index,
+                region_id=region_id,
+                cell_id=cell_id,
+                column_id=column_id,
+                paragraph_id=paragraph_id,
+                callout_id=callout_id,
+                parent_id=(
+                    cluster.parent_id
+                    if cluster.parent_id is not None
+                    else region_id
+                ),
+                structural_role=structural_role,
+                style=cluster.style,
+                font_size=cluster.font_size,
+            )
+        )
+    normalized_barriers = tuple(
+        bound for value in barriers if (bound := _rect(value)) is not None
+    )
+    reconstruction = build_logical_units(fragments, barriers=normalized_barriers)
+    if metrics is not None:
+        metrics.absorb(reconstruction.metrics)
+
+    result: list[TableTextCluster] = []
+    for unit in reconstruction.units:
+        children = [by_id[item.fragment_id] for item in unit.fragments]
+        regions = tuple(
+            dict.fromkeys(
+                region
+                for child in children
+                for region in (child.regions or (child.bbox,))
+            )
+        )
+        result.append(
+            TableTextCluster(
+                unit.bbox,
+                unit.text,
+                tuple(word for child in children for word in child.words),
+                regions,
+                font_size=max(
+                    (
+                        child.font_size
+                        for child in children
+                        if child.font_size is not None
+                    ),
+                    default=None,
+                ),
+                parent_id=children[0].parent_id if children else None,
+            )
+        )
     return result
 
 
@@ -341,8 +538,25 @@ def structural_page_text_clusters(
         selected_text = " ".join(str(word[4]) for word in selected)
         if not selected or not should_translate_table_cell(selected_text):
             continue
+        source_bounds = _word_bounds(selected)
+        render_bounds = source_bounds
+        if kind in {"TOC", "INDEX"} and end < len(line_words):
+            next_x = min(float(word[0]) for word in line_words[end:])
+            if next_x > source_bounds[2] + 2:
+                render_bounds = (
+                    source_bounds[0],
+                    source_bounds[1],
+                    next_x - 2,
+                    source_bounds[3],
+                )
         result.append(
-            TableTextCluster(_word_bounds(selected), selected_text, tuple(selected))
+            TableTextCluster(
+                source_bounds,
+                selected_text,
+                tuple(selected),
+                (source_bounds,),
+                render_bounds,
+            )
         )
     return result
 
@@ -363,9 +577,22 @@ def immutable_metadata_regions(
         for line in block.get("lines", ()):
             characters: list[tuple[str, tuple[float, float, float, float]]] = []
             for span in line.get("spans", ()):
+                span_bounds = upright_line_bounds(
+                    {"bbox": span.get("bbox", ()), "spans": (span,)}
+                )
                 for character in span.get("chars", ()):
                     bounds = _rect(character.get("bbox", ()))
                     text = str(character.get("c", ""))
+                    if bounds is not None and span_bounds is not None:
+                        char_height = bounds[3] - bounds[1]
+                        span_height = span_bounds[3] - span_bounds[1]
+                        if span_height > 0 and char_height > span_height * 2.5:
+                            bounds = (
+                                bounds[0],
+                                span_bounds[1],
+                                bounds[2],
+                                span_bounds[3],
+                            )
                     if bounds is not None and text:
                         characters.append((text, bounds))
             if not characters:

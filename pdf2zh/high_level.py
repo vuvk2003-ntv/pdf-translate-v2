@@ -12,6 +12,7 @@ from asyncio import CancelledError
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from statistics import mean, median
 from string import Template
 from typing import Any, BinaryIO, Dict, List, Optional
 
@@ -28,6 +29,7 @@ from pymupdf import Document, Font
 
 from pdf2zh.converter import TranslateConverter
 from pdf2zh.doclayout import OnnxModel
+from pdf2zh.logical_units import ReconstructionMetrics
 from pdf2zh.pdfinterp import PDFPageInterpreterEx
 from pdf2zh.rules import (
     anchored_translatable_lines,
@@ -35,12 +37,14 @@ from pdf2zh.rules import (
     classify_preserved_page,
     cluster_table_words,
     formula_regions,
+    group_translatable_line_clusters,
     immutable_metadata_regions,
     is_scanned_page,
     matching_table_cells,
     page_has_image,
     should_translate_table_cell,
     structural_page_text_clusters,
+    upright_line_bounds,
     upright_table_words,
 )
 
@@ -60,6 +64,58 @@ def install_page_identities(document: Document, envs: Dict | None) -> None:
         raise PDFValueError("Invalid native page-identity provenance")
     for page, identity in zip(document, identities):
         document.xref_set_key(page.xref, PAGE_ID_KEY, f"({identity})")
+
+
+def expose_page_source_fonts(
+    document: Document,
+    page_xref: int,
+    fonts: dict[str, int],
+) -> None:
+    """Expose Form-private font objects to a page-level replacement stream."""
+    if not fonts:
+        return
+
+    owner_xref = page_xref
+    resources_type = "null"
+    resources_value = "null"
+    seen: set[int] = set()
+    while owner_xref not in seen:
+        seen.add(owner_xref)
+        resources_type, resources_value = document.xref_get_key(
+            owner_xref, "Resources"
+        )
+        if resources_type != "null":
+            break
+        parent_type, parent_value = document.xref_get_key(owner_xref, "Parent")
+        if parent_type != "xref":
+            break
+        owner_xref = int(parent_value.split()[0])
+
+    if resources_type == "xref":
+        resources_xref = int(resources_value.split()[0])
+    else:
+        resources_xref = document.get_new_xref()
+        resource_dictionary = resources_value if resources_type == "dict" else "<<>>"
+        document.update_object(resources_xref, resource_dictionary)
+        document.xref_set_key(owner_xref, "Resources", f"{resources_xref} 0 R")
+
+    font_type, font_value = document.xref_get_key(resources_xref, "Font")
+    if font_type == "xref":
+        font_dictionary_xref = int(font_value.split()[0])
+    else:
+        font_dictionary_xref = document.get_new_xref()
+        font_dictionary = font_value if font_type == "dict" else "<<>>"
+        document.update_object(font_dictionary_xref, font_dictionary)
+        document.xref_set_key(
+            resources_xref, "Font", f"{font_dictionary_xref} 0 R"
+        )
+
+    for font_name, font_xref in fonts.items():
+        document.xref_set_key(
+            font_dictionary_xref,
+            font_name,
+            f"{font_xref} 0 R",
+        )
 
 
 @dataclass(frozen=True)
@@ -82,8 +138,30 @@ class TranslationReport:
     preserved_segments: int = 0
     unresolved_segments: int = 0
     unique_translation_units: int = 0
+    raw_text_spans: int = 0
+    candidate_fragments: int = 0
+    assigned_candidate_fragments: int = 0
+    unassigned_candidate_fragments: int = 0
+    duplicate_fragment_assignments: int = 0
+    logical_units: int = 0
+    provider_bound_units: int = 0
+    merged_fragment_count: int = 0
+    singleton_unit_count: int = 0
+    continuation_candidate_count: int = 0
+    accepted_merge_count: int = 0
+    rejected_merge_count: int = 0
+    rejected_cross_cell: int = 0
+    rejected_cross_column: int = 0
+    rejected_structural_role: int = 0
+    rejected_page_boundary: int = 0
+    rejected_geometry: int = 0
+    rejected_linguistic_boundary: int = 0
+    average_chars_per_unit: float = 0.0
+    median_chars_per_unit: float = 0.0
+    max_chars_per_unit: int = 0
     cache_hits: int = 0
     provider_requests: int = 0
+    retry_units: int = 0
     handoff_table_hits: int = 0
     handoff_misses: int = 0
     translation_seconds: float = 0.0
@@ -338,6 +416,10 @@ def translate_patch(
     # layout_bounds because that one marks a table cell and changes how a
     # paragraph is fitted. This is only a measure to compare line ends against.
     class_bounds = {}
+    # Fresh class ids whose physical lines form one logical occurrence, even
+    # when the source PDF stores those lines in separate Form XObjects.
+    logical_classes = {}
+    reconstruction = ReconstructionMetrics()
     scanned_pages = set()
     pages_with_images = set()
     device = TranslateConverter(
@@ -359,6 +441,7 @@ def translate_patch(
         style_fonts,
         synthetic_styles,
         class_bounds,
+        logical_classes,
     )
 
     assert device is not None
@@ -404,6 +487,7 @@ def translate_patch(
                 if page_layout.names[int(d.cls)] not in vcls
             ]
             page_class_bounds = class_bounds.setdefault(page.pageno, {})
+            page_logical_classes = logical_classes.setdefault(page.pageno, set())
             for i, d in reversed(non_vcls_boxes):
                 x0, y0, x1, y1 = d.xyxy.squeeze()
                 page_class_bounds[i + 2] = (
@@ -454,6 +538,8 @@ def translate_patch(
                 detected_tables = []
             next_class = len(page_layout.boxes) + 2
             page_bounds = layout_bounds.setdefault(page.pageno, {})
+            page_cell_ids: dict[int, tuple[Any, ...]] = {}
+            page_logical_classes = logical_classes.setdefault(page.pageno, set())
             page_height = float(page_rect.height)
             page_words = upright_table_words(
                 source_page.get_text("words", sort=True),
@@ -492,6 +578,14 @@ def translate_patch(
                         padded = table_cluster_render_bounds(cluster.bbox, page_height)
                         if padded is not None:
                             page_bounds[next_class] = padded
+                        page_cell_ids[next_class] = (
+                            "table-cell",
+                            round(cx0, 2),
+                            round(cy0, 2),
+                            round(cx1, 2),
+                            round(cy1, 2),
+                            tuple(round(value, 2) for value in cluster.bbox),
+                        )
                         next_class += 1
 
             # Technical documents often use ordinary prose fonts for equations.
@@ -532,9 +626,17 @@ def translate_patch(
             # above keep their existing bounds and fitting behavior on ordinary
             # pages. Every recovered line receives one class and one fixed bound.
             anchor_blocks = source_page.get_text("dict")["blocks"]
+            reconstruction.raw_text_spans += sum(
+                len(line.get("spans", ()))
+                for block in anchor_blocks
+                for line in block.get("lines", ())
+            )
             anchor_lines = [
-                line["bbox"] for block in anchor_blocks for line in block.get("lines", ())
-                if abs(line.get("dir", (1,0))[1]) < 0.01
+                bounds
+                for block in anchor_blocks
+                for line in block.get("lines", ())
+                if abs(line.get("dir", (1, 0))[1]) < 0.01
+                if (bounds := upright_line_bounds(line)) is not None
             ]
             anchor_barriers = []
             for drawing in source_page.get_drawings():
@@ -551,37 +653,143 @@ def translate_patch(
                     anchor_barriers.extend(((r[0],r[1],r[2],r[1]),(r[0],r[3],r[2],r[3]),(r[0],r[1],r[0],r[3]),(r[2],r[1],r[2],r[3])))
             protected_names = {"figure", "table", "abandon", "formula_caption"}
             if preservation is None:
-                anchors = anchored_translatable_lines(anchor_blocks)
-            else:
-                anchors = structural_page_text_clusters(page_words, preservation.kind)
-            for anchor in anchors:
-                ax0, ay0, ax1, ay1 = anchor.bbox
-                cx = int(np.clip((ax0+ax1)/2, 0, w-1))
-                cy = int(np.clip(h-(ay0+ay1)/2, 0, h-1))
-                if box[cy, cx] != 0:
-                    continue
-                if preservation is None:
+                physical_anchors = anchored_translatable_lines(anchor_blocks)
+                # A PDF producer may wrap one paragraph into several Form
+                # XObjects.  Give conservative continuations inside the same
+                # model region a fresh shared class; the converter can then
+                # translate/fallback the complete occurrence atomically even
+                # though the source containers are separate.
+                ordinary_by_class: dict[tuple[int, Any], list[Any]] = {}
+                for anchor in physical_anchors:
+                    ax0, ay0, ax1, ay1 = anchor.bbox
+                    cx = int(np.clip((ax0 + ax1) / 2, 0, w - 1))
+                    cy = int(np.clip(h - (ay0 + ay1) / 2, 0, h - 1))
+                    original_class = int(box[cy, cx])
+                    if original_class > 0:
+                        # Class 1 is text outside a model box. Its extracted
+                        # source block is the only established parent; never
+                        # treat the whole unclassified page as one region.
+                        parent = anchor.parent_id if original_class == 1 else None
+                        ordinary_by_class.setdefault(
+                            (original_class, parent), []
+                        ).append(anchor)
+                for (original_class, source_parent), class_anchors in ordinary_by_class.items():
+                    region_identity = (
+                        ("source-parent", source_parent)
+                        if original_class == 1
+                        else ("layout", original_class)
+                    )
+                    for group in group_translatable_line_clusters(
+                        class_anchors,
+                        barriers=anchor_barriers,
+                        page=page.pageno,
+                        region_id=region_identity,
+                        cell_id=page_cell_ids.get(original_class),
+                        metrics=reconstruction,
+                        fragment_id_prefix=f"p{page.pageno + 1}-anchor",
+                    ):
+                        for sx0, sy0, sx1, sy1 in group.regions or (group.bbox,):
+                            px0, py0, px1, py1 = (
+                                int(np.clip(sx0 - 1, 0, w - 1)),
+                                int(np.clip(h - sy1 - 1, 0, h - 1)),
+                                int(np.clip(sx1 + 1, 0, w - 1)),
+                                int(np.clip(h - sy0 + 1, 0, h - 1)),
+                            )
+                            box[py0:py1, px0:px1] = next_class
+                        layout_bound = page_bounds.get(original_class)
+                        class_bound = page_class_bounds.get(original_class)
+                        if layout_bound is not None:
+                            page_bounds[next_class] = layout_bound
+                        elif len(group.regions) > 1 and class_bound is not None:
+                            # A merged result needs the original region as one
+                            # fitting surface for atomic render/fallback.
+                            page_bounds[next_class] = class_bound
+                        elif class_bound is not None:
+                            page_class_bounds[next_class] = class_bound
+                        if len(group.regions) > 1:
+                            page_logical_classes.add(next_class)
+                        next_class += 1
+                protected_parents = [
+                    tuple(float(value) for value in detection.xyxy.squeeze())
+                    for detection in page_layout.boxes
+                    if page_layout.names[int(detection.cls)] in protected_names
+                ]
+                anchors_by_parent: dict[
+                    tuple[float, float, float, float], list[Any]
+                ] = {}
+                for anchor in physical_anchors:
+                    ax0, ay0, ax1, ay1 = anchor.bbox
+                    cx = int(np.clip((ax0 + ax1) / 2, 0, w - 1))
+                    cy = int(np.clip(h - (ay0 + ay1) / 2, 0, h - 1))
+                    if box[cy, cx] != 0:
+                        continue
                     parents = [
-                        tuple(float(v) for v in d.xyxy.squeeze())
-                        for d in page_layout.boxes
-                        if page_layout.names[int(d.cls)] in protected_names
-                        and float(d.xyxy.squeeze()[0]) <= (ax0+ax1)/2 <= float(d.xyxy.squeeze()[2])
-                        and float(d.xyxy.squeeze()[1]) <= (ay0+ay1)/2 <= float(d.xyxy.squeeze()[3])
+                        parent
+                        for parent in protected_parents
+                        if parent[0] <= (ax0 + ax1) / 2 <= parent[2]
+                        and parent[1] <= (ay0 + ay1) / 2 <= parent[3]
                     ]
                     if not parents:
                         continue
-                    parent = min(parents,key=lambda r:(r[2]-r[0])*(r[3]-r[1]))
+                    parent = min(
+                        parents,
+                        key=lambda value: (value[2] - value[0])
+                        * (value[3] - value[1]),
+                    )
+                    anchors_by_parent.setdefault(parent, []).append(anchor)
+                anchors_with_parents = [
+                    (anchor, parent)
+                    for parent, parent_anchors in anchors_by_parent.items()
+                    for anchor in group_translatable_line_clusters(
+                        parent_anchors,
+                        barriers=anchor_barriers,
+                        page=page.pageno,
+                        region_id=("protected", parent),
+                        callout_id=("protected", parent),
+                        metrics=reconstruction,
+                        fragment_id_prefix=f"p{page.pageno + 1}-anchor",
+                    )
+                ]
+            else:
+                structural_anchors = structural_page_text_clusters(
+                    page_words, preservation.kind
+                )
+                anchors_with_parents = [
+                    (unit, None)
+                    for index, anchor in enumerate(structural_anchors)
+                    for unit in group_translatable_line_clusters(
+                        [anchor],
+                        page=page.pageno,
+                        region_id=("structural", index),
+                        structural_role=preservation.kind,
+                        metrics=reconstruction,
+                        fragment_id_prefix=f"p{page.pageno + 1}-structural-{index}",
+                    )
+                ]
+            for anchor, parent in anchors_with_parents:
+                ax0, ay0, ax1, ay1 = anchor.bbox
+                if preservation is None:
+                    assert parent is not None
+                    source_regions = anchor.regions or (anchor.bbox,)
+                    other_lines = [
+                        line
+                        for line in anchor_lines
+                        if not any(tuple(line) == tuple(region) for region in source_regions)
+                    ]
                     rx0,ry0,rx1,ry1=anchored_prose_bounds(
-                        anchor.bbox,parent,anchor_lines,anchor_barriers
+                        anchor.bbox,parent,other_lines,anchor_barriers
                     )
                 else:
-                    rx0, ry0, rx1, ry1 = anchor.bbox
-                px0, py0, px1, py1 = (
-                    int(np.clip(ax0-1,0,w-1)), int(np.clip(h-ay1-1,0,h-1)),
-                    int(np.clip(ax1+1,0,w-1)), int(np.clip(h-ay0+1,0,h-1)),
-                )
-                box[py0:py1,px0:px1] = next_class
+                    rx0, ry0, rx1, ry1 = anchor.render_bbox or anchor.bbox
+                for sx0, sy0, sx1, sy1 in anchor.regions or (anchor.bbox,):
+                    px0, py0, px1, py1 = (
+                        int(np.clip(sx0-1,0,w-1)), int(np.clip(h-sy1-1,0,h-1)),
+                        int(np.clip(sx1+1,0,w-1)), int(np.clip(h-sy0+1,0,h-1)),
+                    )
+                    box[py0:py1,px0:px1] = next_class
                 page_bounds[next_class] = (rx0, page_height-ry1, rx1, page_height-ry0)
+                if len(anchor.regions) > 1:
+                    page_logical_classes.add(next_class)
                 next_class += 1
 
             # Reapply exact metadata after carving translatable labels out
@@ -590,6 +798,15 @@ def translate_patch(
             raw_blocks = source_page.get_text("rawdict")["blocks"]
             for metadata in immutable_metadata_regions(raw_blocks):
                 mx0, my0, mx1, my1 = metadata.bbox
+                # These syntax patterns describe headers, footers and title
+                # blocks.  Applying them across body prose mistakes values such
+                # as serial standards ("RS 232 / 422 / 485") for page metadata
+                # and cuts one logical sentence into three translation units.
+                if not (
+                    my1 <= page_height * 0.2
+                    or my0 >= page_height * 0.8
+                ):
+                    continue
                 px0, py0, px1, py1 = (
                     int(np.clip(mx0 - 0.5, 0, w - 1)),
                     int(np.clip(h - my1 - 0.5, 0, h - 1)),
@@ -608,6 +825,14 @@ def translate_patch(
             doc_zh.update_stream(page.page_xref, b"")
             doc_zh[page.pageno].set_contents(page.page_xref)
             interpreter.process_page(page)
+            # Atomic page-level fallback can replay glyphs from several Form
+            # XObjects. Expose those existing font objects to the page stream
+            # under collision-resistant aliases chosen by the converter.
+            expose_page_source_fonts(
+                doc_zh,
+                doc_zh[page.pageno].xref,
+                device.source_font_xrefs_by_page.get(page.pageno, {}),
+            )
 
     device.close()
     unresolved_segments = len(device.translation_failures)
@@ -619,6 +844,16 @@ def translate_patch(
         preserved_segments,
         unresolved_segments,
     )
+    reconstruction.assert_conservation()
+    if device.translatable_segments > device.extracted_segments:
+        raise RuntimeError("provider-bound units exceed reconstructed logical units")
+    merged_unit_count = (
+        reconstruction.logical_units - reconstruction.singleton_unit_count
+    )
+    singleton_unit_count = max(
+        0, device.extracted_segments - merged_unit_count
+    )
+    unit_char_counts = device.logical_unit_char_counts
 
     metrics = device.translator.metrics()
     return obj_patch, TranslationReport(
@@ -632,8 +867,30 @@ def translate_patch(
         preserved_segments=preserved_segments,
         unresolved_segments=unresolved_segments,
         unique_translation_units=device.unique_translation_units,
+        raw_text_spans=reconstruction.raw_text_spans,
+        candidate_fragments=reconstruction.candidate_fragments,
+        assigned_candidate_fragments=reconstruction.assigned_candidate_fragments,
+        unassigned_candidate_fragments=reconstruction.unassigned_candidate_fragments,
+        duplicate_fragment_assignments=reconstruction.duplicate_fragment_assignments,
+        logical_units=device.extracted_segments,
+        provider_bound_units=device.translatable_segments,
+        merged_fragment_count=reconstruction.merged_fragment_count,
+        singleton_unit_count=singleton_unit_count,
+        continuation_candidate_count=reconstruction.continuation_candidate_count,
+        accepted_merge_count=reconstruction.accepted_merge_count,
+        rejected_merge_count=reconstruction.rejected_merge_count,
+        rejected_cross_cell=reconstruction.rejected_cross_cell,
+        rejected_cross_column=reconstruction.rejected_cross_column,
+        rejected_structural_role=reconstruction.rejected_structural_role,
+        rejected_page_boundary=reconstruction.rejected_page_boundary,
+        rejected_geometry=reconstruction.rejected_geometry,
+        rejected_linguistic_boundary=reconstruction.rejected_linguistic_boundary,
+        average_chars_per_unit=mean(unit_char_counts) if unit_char_counts else 0.0,
+        median_chars_per_unit=median(unit_char_counts) if unit_char_counts else 0.0,
+        max_chars_per_unit=max(unit_char_counts, default=0),
         cache_hits=int(metrics.get("cache_hits", 0)),
         provider_requests=int(metrics.get("translation_requests", 0)),
+        retry_units=device.retry_units,
         handoff_table_hits=int(metrics.get("handoff_table_hits", 0)),
         handoff_misses=int(metrics.get("handoff_misses", 0)),
         translation_seconds=float(metrics.get("translation_seconds", 0.0)),

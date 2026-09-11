@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
 # Bump when classifier/validation semantics change; old cache entries stay on disk.
-TRANSLATION_RULES_VERSION = "code4life-translation-v3"
+TRANSLATION_RULES_VERSION = "code4life-translation-v4"
 
 # Reviewed, exact source aliases only. Adding or changing an entry also requires
 # a translation-rules revision so an older cache cannot bypass the new invariant.
@@ -23,6 +23,16 @@ class ProperNameSpan:
     start: int
     end: int
     name: str
+
+
+@dataclass(frozen=True)
+class ProtectedLiteralSpan:
+    """A source slice that must cross the translation provider unchanged."""
+
+    start: int
+    end: int
+    literal: str
+    kind: str
 
 
 class VerifiedProperNameError(ValueError):
@@ -133,15 +143,47 @@ class TechnicalInvariantError(ValueError):
 
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_WINDOWS_PATH_PREFIX = r"(?:[A-Za-z]:\\|\\\\)"
+_TECHNICAL_FILE_EXTENSION = (
+    r"pdf|jsonl|csv|txt|xml|yaml|yml|ini|cfg|log|py|ps1|sh|exe|dll|bin|"
+    r"hex|gxw|gx3|prx"
+)
 WINDOWS_PATH_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])(?:[A-Za-z]:\\|\\\\)[^\s<>\"|?*]+"
+    rf"(?<![A-Za-z0-9])(?:"
+    # A bounded path/template with a known file extension may contain Unicode,
+    # spaces and typographic apostrophes.  This covers filename templates such
+    # as C:\\J1C\\ 오늘날짜-시’분’초’.txt without freezing following prose.
+    rf"{_WINDOWS_PATH_PREFIX}[^<>:\"/|?*;\r\n]{{1,240}}?\."
+    rf"(?:{_TECHNICAL_FILE_EXTENSION})(?=$|[\s,;:!?\)\]\}}\"'”’])|"
+    # Keep the compact extensionless/path-token behavior used by earlier rules.
+    rf"{_WINDOWS_PATH_PREFIX}[^\s<>\"|?*]+"
+    rf")",
+    re.IGNORECASE,
 )
 POSIX_PATH_PATTERN = re.compile(r"(?<![\w:])(?:\.{0,2}/|/)[\w.-]+(?:/[\w.-]+)+")
 FILE_NAME_PATTERN = re.compile(
-    r"(?<![\w.-])[\w.-]+\.(?:pdf|jsonl|csv|txt|xml|yaml|yml|ini|cfg|log|py|"
-    r"ps1|sh|exe|dll|bin|hex|gxw|gx3|prx)(?![\w.-])",
+    rf"(?<![\w.-])[\w.-]+\.(?:{_TECHNICAL_FILE_EXTENSION})(?![\w.-])",
     re.IGNORECASE,
 )
+DOCUMENT_LABEL_PATTERN = re.compile(r"(?<!\w)Page\s+No\.?(?!\w)")
+
+
+def find_windows_path_literals(text: str) -> tuple[ProtectedLiteralSpan, ...]:
+    """Return complete Windows path/template literals in source order."""
+    return tuple(
+        ProtectedLiteralSpan(match.start(), match.end(), match.group(0), "Windows path")
+        for match in WINDOWS_PATH_PATTERN.finditer(text)
+    )
+
+
+def find_document_label_literals(text: str) -> tuple[ProtectedLiteralSpan, ...]:
+    """Return fixed document-control labels embedded in a larger text run."""
+    return tuple(
+        ProtectedLiteralSpan(
+            match.start(), match.end(), match.group(0), "document-control label"
+        )
+        for match in DOCUMENT_LABEL_PATTERN.finditer(text)
+    )
 IPV4_PATTERN = re.compile(
     r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)"
     r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])"
@@ -302,6 +344,7 @@ TOKEN_CHECKS: tuple[tuple[str, Callable[[str], list[str]]], ...] = (
     ("Windows paths", lambda text: _regex_tokens(WINDOWS_PATH_PATTERN, text)),
     ("POSIX paths", lambda text: _regex_tokens(POSIX_PATH_PATTERN, text)),
     ("file names", lambda text: _regex_tokens(FILE_NAME_PATTERN, text)),
+    ("document-control labels", lambda text: _regex_tokens(DOCUMENT_LABEL_PATTERN, text)),
     ("IPv4 addresses", lambda text: _regex_tokens(IPV4_PATTERN, text)),
     ("network endpoints", lambda text: _regex_tokens(NETWORK_ENDPOINT_PATTERN, text)),
     (
@@ -472,9 +515,23 @@ _KOREAN_CONTEXTUAL_ENGLISH_TERMS = (
     ("Utility", re.compile(r"공사|설비|장비|공장|배관|전원|공급|연결|시공|현장")),
     ("Qualification", re.compile(r"설비|장비|공정|수행|검증|인증|평가")),
 )
-_KOREAN_UI_WORD_PATTERN = re.compile(r"(?<!\w)(Start|Save|Reset)(?=\s*버튼)")
 _KOREAN_QUOTED_UI_PATTERN = re.compile(
-    r'["“]([A-Za-z][A-Za-z0-9 _./:&()+-]{0,79})["”]\s*(?:항목|메뉴)'
+    r'["“]\s*([A-Za-z][A-Za-z0-9 _./:&()+-]{0,79}?)\s*["”]'
+)
+_KOREAN_UI_BEFORE_ROLE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"([A-Z][A-Za-z0-9]*(?:[ \t]+[A-Z][A-Za-z0-9]*){0,4})"
+    r"(?=\s*(?:버튼|메뉴|패널|창|화면|체크박스|모드|항목))"
+)
+_KOREAN_UI_ROLE_LABEL_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"([A-Z][A-Za-z0-9]*(?:[ \t]+[A-Z][A-Za-z0-9]*){0,3}[ \t]+"
+    r"(?:Panel|Window|Button|Menu|Mode|Option|Data))"
+    r'(?=\s*(?:[)\]"”]|[가-힣]|$))'
+)
+_KOREAN_LEADING_UI_PATTERN = re.compile(
+    r"^\s*(?:[-•■□▪]\s*)?"
+    r"([A-Z][A-Za-z0-9]*(?:[ \t]+[A-Z][A-Za-z0-9]*){0,4})\s*:"
 )
 _KOREAN_ACRONYM_PATTERN = re.compile(r"(?<!\w)[A-Z]{2,8}(?:/[A-Z0-9]{1,8})?(?!\w)")
 _KOREAN_RANGE_PATTERN = re.compile(
@@ -504,6 +561,48 @@ def _literal_ascii_count(text: str, term: str) -> int:
     return len(re.findall(rf"(?<!\w){re.escape(term)}(?!\w)", text))
 
 
+def protected_korean_ui_labels(
+    text: str,
+    terminology: Mapping[str, str] | None = None,
+) -> tuple[ProtectedLiteralSpan, ...]:
+    """Return English labels whose Korean syntax identifies them as UI text.
+
+    Quotation, a UI-role noun, or a leading ``Label:`` form is required.  This
+    avoids freezing arbitrary Title Case English embedded in ordinary prose.
+    Explicit terminology entries keep precedence and therefore are omitted.
+    """
+    if not contains_hangul(text):
+        return ()
+    overrides = terminology or {}
+    candidates: list[ProtectedLiteralSpan] = []
+    patterns = (
+        _KOREAN_QUOTED_UI_PATTERN,
+        _KOREAN_UI_BEFORE_ROLE_PATTERN,
+        _KOREAN_UI_ROLE_LABEL_PATTERN,
+        _KOREAN_LEADING_UI_PATTERN,
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            literal = match.group(1).strip()
+            if not literal or literal in overrides:
+                continue
+            relative = match.group(0).find(match.group(1))
+            start = match.start() + relative
+            while start < match.end() and text[start].isspace():
+                start += 1
+            end = start + len(literal)
+            candidates.append(ProtectedLiteralSpan(start, end, literal, "Korean UI label"))
+    candidates.sort(key=lambda span: (span.start, -(span.end - span.start)))
+    selected: list[ProtectedLiteralSpan] = []
+    cursor = -1
+    for candidate in candidates:
+        if candidate.start < cursor:
+            continue
+        selected.append(candidate)
+        cursor = candidate.end
+    return tuple(selected)
+
+
 def validate_korean_english_spans(
     source: str,
     translated: str,
@@ -524,8 +623,7 @@ def validate_korean_english_spans(
             and _literal_ascii_count(source, term)
         ):
             protected.extend([term] * _literal_ascii_count(source, term))
-    protected.extend(match[1] for match in _KOREAN_UI_WORD_PATTERN.finditer(source))
-    protected.extend(match[1] for match in _KOREAN_QUOTED_UI_PATTERN.finditer(source))
+    protected.extend(span.literal for span in protected_korean_ui_labels(source, terminology))
     protected.extend(match[0] for match in _KOREAN_ACRONYM_PATTERN.finditer(source))
     required = Counter(protected)
     missing = tuple(

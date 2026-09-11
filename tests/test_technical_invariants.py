@@ -82,6 +82,22 @@ class TechnicalInvariantTests(unittest.TestCase):
             "Theo IEC 60204-2, hãy bật Servo ON.",
         )
 
+    def test_unicode_windows_filename_template_is_one_exact_literal(self):
+        source = "[ C:\\J1C\\ 오늘날짜-시’분’초’.txt ] 파일로 자동 저장된다."
+        validate_technical_invariants(
+            source,
+            "Tệp được tự động lưu dưới dạng [ C:\\J1C\\ 오늘날짜-시’분’초’.txt ].",
+        )
+        self.assert_rejected(
+            source,
+            "Tệp được lưu tại [ C:\\J1C\\ Today's date-hour'phút'second'.txt ].",
+        )
+
+    def test_document_control_label_inside_header_stays_exact(self):
+        source = "J1C 5.2 Protocol Analyzer 5.2 Page No 17"
+        validate_technical_invariants(source, source)
+        self.assert_rejected(source, "J1C 5.2 Protocol Analyzer 5.2 Trang số 17")
+
 
 if __name__ == "__main__":
     unittest.main()
