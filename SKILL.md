@@ -28,11 +28,18 @@ Use the interpreter inside `<skill-root>/.venv`:
 
 ## Choose a mode
 
-For performance profiling or Patch D work, read
+For performance profiling or Patch D/D2 work, read
 [performance profiling](references/performance-profiling.md). Use measured
 timer boundaries before choosing an optimization. `--profile-only` still
 reads/processes the PDF locally; when the user forbids PDF processing, use only
 the synthetic string/JSONL fixtures and mark real-document gates `NOT_RUN`.
+
+The bundled worker uses D2 typed retry limits: one local evaluation for the
+Google source-length guard, two attempts for post-provider quality rejection,
+and eight for transport/unknown errors. Safe shared Google failures can reuse
+the first unresolved reason within one document. Read the D2 section in the
+profiling reference for eligibility and acceptance limits; a two-attempt cap
+does not prove that a later provider attempt could never succeed.
 
 | Mode | Translator | Use when |
 | --- | --- | --- |

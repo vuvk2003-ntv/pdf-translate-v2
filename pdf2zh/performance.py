@@ -117,7 +117,7 @@ class PerformanceProfile:
             with self._lock:
                 self._seconds[name] += seconds
 
-    def count(self, name: str, amount: int = 1) -> None:
+    def count(self, name: str, amount: int | float = 1) -> None:
         if self.enabled:
             with self._lock:
                 self._counts[name] += amount

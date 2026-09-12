@@ -1,0 +1,75 @@
+{
+  "scope": "controlled synthetic workload only; real PDF benchmark NOT_RUN",
+  "checks": {
+    "outcomes": true,
+    "identity_sets": true,
+    "accounting": true
+  },
+  "identity_sets": {
+    "before": {
+      "translated": [
+        "0498eb860a31be4a",
+        "e67164f06704e82a"
+      ],
+      "preserved": [
+        "62467b3af8813fe1",
+        "f03d273f811cb088"
+      ],
+      "unresolved": [
+        "054bab82120e9740",
+        "383c3ebaaebf44c9",
+        "70f3bde3b194f961",
+        "f4caad59c792ed10"
+      ]
+    },
+    "after": {
+      "translated": [
+        "0498eb860a31be4a",
+        "e67164f06704e82a"
+      ],
+      "preserved": [
+        "62467b3af8813fe1",
+        "f03d273f811cb088"
+      ],
+      "unresolved": [
+        "054bab82120e9740",
+        "383c3ebaaebf44c9",
+        "70f3bde3b194f961",
+        "f4caad59c792ed10"
+      ]
+    }
+  },
+  "identity_set_differences": {
+    "translated": {
+      "removed": [],
+      "added": []
+    },
+    "preserved": {
+      "removed": [],
+      "added": []
+    },
+    "unresolved": {
+      "removed": [],
+      "added": []
+    }
+  },
+  "accounting": {
+    "before": {
+      "accounting_coverage": 1.0,
+      "duplicate_source_span_assignments": 0,
+      "unassigned_source_spans": 0,
+      "translated_occurrences": 3,
+      "allowed_preserve_occurrences": 2,
+      "unresolved_occurrences": 5
+    },
+    "after": {
+      "accounting_coverage": 1.0,
+      "duplicate_source_span_assignments": 0,
+      "unassigned_source_spans": 0,
+      "translated_occurrences": 3,
+      "allowed_preserve_occurrences": 2,
+      "unresolved_occurrences": 5
+    }
+  },
+  "status": "PASS_SYNTHETIC_ONLY"
+}

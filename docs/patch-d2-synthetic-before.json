@@ -1,0 +1,252 @@
+{
+  "real_pdf": false,
+  "live_provider": false,
+  "cache_mode": "cold-isolated",
+  "workload": "identical strings, fake HTTP responses, temporary in-memory cache, synthetic ledger",
+  "timing_note": "Synthetic clock advances 0.02s/request and nominal sleep; not a PDF speedup",
+  "converter_source_sha256": "1dd9766b645a2b95cad446a6b8dfae8f9580fff5dc87003e10c0000298c6eb40",
+  "result": {
+    "policy": "legacy8",
+    "synthetic_total_seconds": 618.7199999999998,
+    "local_test_elapsed_seconds": 0.025352100004965905,
+    "provider_calls": 36,
+    "provider_calls_by_source": {
+      "Set D100 to 10 and D200 to 20.": 16,
+      "Set the communication parameters.": 1,
+      "Check the connection before using the controller.": 3,
+      "Manual": 16
+    },
+    "retry_sleep_schedule": [
+      1.0,
+      2.0,
+      4.0,
+      8.0,
+      16.0,
+      32.0,
+      60.0,
+      1.0,
+      2.0,
+      1.0,
+      2.0,
+      4.0,
+      8.0,
+      16.0,
+      32.0,
+      60.0,
+      1.0,
+      2.0,
+      4.0,
+      8.0,
+      16.0,
+      32.0,
+      60.0,
+      1.0,
+      2.0,
+      4.0,
+      8.0,
+      16.0,
+      32.0,
+      60.0,
+      1.0,
+      2.0,
+      4.0,
+      8.0,
+      16.0,
+      32.0,
+      60.0
+    ],
+    "outcomes": [
+      {
+        "occurrence_id": "page-0-occ-0",
+        "identity": "054bab82120e9740",
+        "status": "unresolved",
+        "reason": "TechnicalInvariantError"
+      },
+      {
+        "occurrence_id": "page-0-occ-1",
+        "identity": "e67164f06704e82a",
+        "status": "translated",
+        "reason": null
+      },
+      {
+        "occurrence_id": "page-0-occ-2",
+        "identity": "0498eb860a31be4a",
+        "status": "translated",
+        "reason": null
+      },
+      {
+        "occurrence_id": "page-0-occ-3",
+        "identity": "383c3ebaaebf44c9",
+        "status": "unresolved",
+        "reason": "TranslationIntegrityError"
+      },
+      {
+        "occurrence_id": "page-0-occ-4",
+        "identity": "f03d273f811cb088",
+        "status": "preserved",
+        "reason": null
+      },
+      {
+        "occurrence_id": "page-0-occ-5",
+        "identity": "f4caad59c792ed10",
+        "status": "unresolved",
+        "reason": "SegmentTooLongError"
+      },
+      {
+        "occurrence_id": "page-1-occ-0",
+        "identity": "054bab82120e9740",
+        "status": "unresolved",
+        "reason": "TechnicalInvariantError"
+      },
+      {
+        "occurrence_id": "page-1-occ-1",
+        "identity": "e67164f06704e82a",
+        "status": "translated",
+        "reason": null
+      },
+      {
+        "occurrence_id": "page-1-occ-2",
+        "identity": "70f3bde3b194f961",
+        "status": "unresolved",
+        "reason": "TranslationIntegrityError"
+      },
+      {
+        "occurrence_id": "page-1-occ-3",
+        "identity": "62467b3af8813fe1",
+        "status": "preserved",
+        "reason": null
+      }
+    ],
+    "identity_sets": {
+      "translated": [
+        "0498eb860a31be4a",
+        "e67164f06704e82a"
+      ],
+      "preserved": [
+        "62467b3af8813fe1",
+        "f03d273f811cb088"
+      ],
+      "unresolved": [
+        "054bab82120e9740",
+        "383c3ebaaebf44c9",
+        "70f3bde3b194f961",
+        "f4caad59c792ed10"
+      ]
+    },
+    "accounting": {
+      "accounting_coverage": 1.0,
+      "duplicate_source_span_assignments": 0,
+      "unassigned_source_spans": 0,
+      "translated_occurrences": 3,
+      "allowed_preserve_occurrences": 2,
+      "unresolved_occurrences": 5
+    },
+    "profile": {
+      "enabled": true,
+      "cache_mode": "cold-isolated",
+      "plan_only": false,
+      "timing_basis": "exclusive per thread; worker time summed; translation_wall overlaps worker stages",
+      "layout_excludes_provider_wait_and_retry": true,
+      "legacy_translation_seconds_is_request_time_sum": true,
+      "handoff_execution_model": "MODEL_A",
+      "handoff_external_wait_measured": false,
+      "timings": {
+        "prepare_seconds": 0.0,
+        "extract_seconds": 0.0,
+        "protection_seconds": 0.0,
+        "reconstruction_seconds": 0.0,
+        "coverage_accounting_seconds": 0.0,
+        "routing_seconds": 0.0,
+        "cache_lookup_seconds": 0.0,
+        "batch_build_seconds": 0.0,
+        "google_wait_seconds": 0.7199999999997444,
+        "handoff_prepare_seconds": 0.0,
+        "handoff_wait_seconds": 0.0,
+        "handoff_import_seconds": 0.0,
+        "retry_seconds": 618.0,
+        "layout_seconds": 0.0,
+        "render_seconds": 0.0,
+        "final_qa_seconds": 0.0,
+        "validation_seconds": 0.0,
+        "translation_wall_seconds": 0.0,
+        "total_seconds": 618.7199999999998,
+        "translation_seconds": 0.004681499980506487
+      },
+      "workload": {
+        "google_cache_probes": 29,
+        "google_cache_misses": 28,
+        "google_units_sent": 36,
+        "google_chars_sent": 756,
+        "google_http_requests": 36,
+        "retry_requests": 37,
+        "google_cache_bypasses": 16,
+        "source_pages": 2,
+        "translated_occurrences": 3,
+        "allowed_preserve_occurrences": 2,
+        "unresolved_occurrences": 5,
+        "google_provider_requests": 44,
+        "google_cache_hits": 1,
+        "raw_text_spans": 0,
+        "candidate_fragments": 0,
+        "logical_units": 0,
+        "provider_bound_units": 0,
+        "total_source_chars": 0,
+        "provider_bound_chars": 0,
+        "preserve_routed_units": 0,
+        "google_routed_units": 0,
+        "handoff_direct_units": 0,
+        "google_to_handoff_escalations": 0,
+        "handoff_provider_batches_or_requests": 0,
+        "retry_units": 0,
+        "handoff_cache_hits": 0,
+        "handoff_cache_misses": 0,
+        "handoff_provider_requests": 0,
+        "handoff_units_sent": 0,
+        "handoff_chars_sent": 0
+      },
+      "batches": {
+        "google": {
+          "batch_count": 36,
+          "units_per_batch_average": 1.0,
+          "units_per_batch_median": 1.0,
+          "chars_per_batch_average": 21.0,
+          "chars_per_batch_median": 30.0,
+          "chars_per_batch_p50": 30.0,
+          "chars_per_batch_p90": 31.5,
+          "chars_per_batch_p99": 49.0,
+          "chars_per_batch_max": 49,
+          "batch_capacity_utilization": 0.0042,
+          "character_capacity": 5000
+        }
+      },
+      "stage_shares": {
+        "prepare_seconds": 0.0,
+        "extract_seconds": 0.0,
+        "protection_seconds": 0.0,
+        "reconstruction_seconds": 0.0,
+        "coverage_accounting_seconds": 0.0,
+        "routing_seconds": 0.0,
+        "cache_lookup_seconds": 0.0,
+        "batch_build_seconds": 0.0,
+        "google_wait_seconds": 0.0011636927851043197,
+        "handoff_prepare_seconds": 0.0,
+        "handoff_wait_seconds": 0.0,
+        "handoff_import_seconds": 0.0,
+        "retry_seconds": 0.9988363072148956,
+        "layout_seconds": 0.0,
+        "render_seconds": 0.0,
+        "final_qa_seconds": 0.0,
+        "validation_seconds": 0.0,
+        "translation_wall_seconds": 0.0
+      },
+      "retry": {
+        "sleep_count": 37,
+        "retry_seconds": 618.0,
+        "average_retry_seconds": 16.7027027027027,
+        "max_retry_seconds": 60.00000000000001
+      },
+      "index_memory_bytes": 0,
+      "batch_histogram_memory_bytes": 760
+    }
+  }
+}

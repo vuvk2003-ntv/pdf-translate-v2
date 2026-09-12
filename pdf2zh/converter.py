@@ -18,7 +18,7 @@ from pdfminer.pdffont import PDFCIDFont, PDFUnicodeNotDefined
 from pdfminer.pdfinterp import PDFGraphicState, PDFResourceManager
 from pdfminer.utils import apply_matrix_pt, mult_matrix
 from pymupdf import Font
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import before_sleep_nothing, retry, wait_exponential
 
 from pdf2zh.integrity import (
     APPROVED_PRESERVE_REASONS,
@@ -42,6 +42,15 @@ from pdf2zh.invariants import (
     is_standalone_verified_proper_name,
 )
 from pdf2zh.performance import profile_from_env
+from pdf2zh.retry_policy import (
+    CONTENT_QUALITY_ERRORS,
+    CONTENT_QUALITY_MAX_ATTEMPTS,
+    PRE_PROVIDER_DETERMINISTIC_ERRORS,
+    TRANSPORT_MAX_ATTEMPTS,
+    _estimated_content_retry_backoff_seconds,
+    _reason_from_exception,
+    _stop_by_failure_class,
+)
 from pdf2zh.routing import RoutingMetadata, route_logical_unit
 from pdf2zh.rules import (
     COMMON_STANDALONE_TECHNICAL_TERM_PATTERN,
@@ -1099,6 +1108,9 @@ class TranslateConverter(PDFConverterEx):
         # translator would have mangled.
         self.failure_reasons: Counter[str] = Counter()
         self._failure_lock = threading.Lock()
+        # One converter is constructed per translate_patch document run.
+        self.known_unsafe_identities: dict[str, str] = {}
+        self._known_unsafe_lock = threading.Lock()
         # Segments the translator was actually asked for. Zero across a whole
         # document means there was no text to translate, not that translation
         # failed - the difference between "run OCR first" and "try again".
@@ -1142,6 +1154,131 @@ class TranslateConverter(PDFConverterEx):
             prompt=prompt,
             ignore_cache=ignore_cache,
         )
+
+    def _make_translation_request(self, record_retry: Callable | None = None) -> Callable:
+        def stop_by_failure_class(retry_state) -> bool:
+            stopped = _stop_by_failure_class(retry_state)
+            if stopped and retry_state.attempt_number < TRANSPORT_MAX_ATTEMPTS:
+                outcome = retry_state.outcome
+                error = outcome.exception() if outcome is not None and outcome.failed else None
+                if isinstance(error, CONTENT_QUALITY_ERRORS):
+                    self.profile.count("content_quality_retry_attempts_capped")
+            return stopped
+
+        @retry(
+            wait=wait_exponential(multiplier=1, min=1, max=60),
+            stop=stop_by_failure_class,
+            before_sleep=record_retry or before_sleep_nothing,
+            before=self.profile.retry_attempt,
+            sleep=self.profile.sleep,
+            reraise=True,
+        )
+        def request_translation(
+            s: str, identity: str, context: dict[str, object] | None
+        ) -> str:
+            return self.translator.translate_with_identity(s, identity, context=context)
+
+        return request_translation
+
+    def _remember_unsafe_identity(self, identity: str, reason: str | None) -> None:
+        if not isinstance(reason, str) or not reason.strip():
+            log.warning("Not caching content failure with an empty unresolved reason")
+            self.profile.count("negative_cache_invalid_reason_rejected")
+            return
+        with self._known_unsafe_lock:
+            self.known_unsafe_identities.setdefault(identity, reason)
+
+    def _translate_segment(
+        self, s: str, identity: str, context: dict[str, object] | None,
+        request_translation: Callable, negative_cache_eligible: bool = False,
+    ) -> tuple[str, bool]:
+        preferred = preferred_translation(s, self.translator.lang_out)
+        if preferred is not None:
+            self.translator.validate(s, preferred)
+            if self.translator.name == "auto" and context is not None:
+                decision = context.get("routing_decision")
+                metadata = context.get("routing_metadata")
+                if decision is not None and metadata is not None:
+                    self.translator.record_local_translation(identity, decision, metadata)
+            return preferred, True
+        encoded = encode_formula_placeholders(s)
+        try:
+            translated = request_translation(encoded, identity, context)
+        except PRE_PROVIDER_DETERMINISTIC_ERRORS:
+            self.profile.count("pre_provider_deterministic_retries_suppressed")
+            raise
+        except CONTENT_QUALITY_ERRORS as error:
+            # Only terminal exceptions from Tenacity reach this branch. Local
+            # preferred-result validation and later formula restore/fit do not.
+            if negative_cache_eligible:
+                self._remember_unsafe_identity(identity, _reason_from_exception(error))
+            raise
+        return (
+            restore_formula_placeholders(s, translated),
+            self.translator.has_translation_for_identity(encoded, identity),
+        )
+
+    def _translate_job(
+        self, s: str, identity: str, context: dict[str, object] | None,
+        job_key: tuple[str, object], request_translation: Callable,
+    ) -> tuple[str, str, str | None, tuple[str, ...]]:
+        # Handoff MODEL_A has no provider invocation here; AUTO uses its own
+        # logical-unit key. Context-bearing/ambiguous jobs remain independent.
+        negative_cache_eligible = (
+            job_key[0] == "shared" and self.translator.name == "google"
+            and context is None and not is_context_sensitive_korean(s)
+        )
+        reason = None
+        if negative_cache_eligible and not self.profile.plan_only:
+            with self._known_unsafe_lock:
+                reason = self.known_unsafe_identities.get(identity)
+        if reason is not None:
+            self.profile.count("negative_cache_skips")
+            self.profile.count("negative_cache_estimated_retry_backoff_seconds_saved",
+                               _estimated_content_retry_backoff_seconds(CONTENT_QUALITY_MAX_ATTEMPTS))
+            return s, "unresolved", reason, ()
+        try:
+            if self.profile.plan_only:
+                preferred = preferred_translation(s, self.translator.lang_out)
+                if preferred is not None:
+                    self.translator.validate(s, preferred)
+                    if self.translator.name == "auto" and context is not None:
+                        self.translator.record_local_translation(
+                            identity, context["routing_decision"], context["routing_metadata"]
+                        )
+                    return preferred, "translated", None, ()
+                planned = self.translator.plan_with_identity(
+                    encode_formula_placeholders(s), identity, context=context
+                )
+                if planned is not None:
+                    return restore_formula_placeholders(s, planned), "translated", None, ()
+                return s, "unresolved", "PERFORMANCE_PLAN_ONLY", ()
+            translated, resolved = self._translate_segment(
+                s, identity, context, request_translation, negative_cache_eligible
+            )
+            if not resolved:
+                unresolved_reason = getattr(self.translator, "unresolved_reason_for_identity", None)
+                reason = (unresolved_reason(identity) if callable(unresolved_reason)
+                          else "UnresolvedSegmentError")
+                return s, "unresolved", reason, ()
+            return translated, "translated", None, ()
+        except BaseException as error:
+            # Preserve the existing source-fallback path for a failed segment.
+            if log.isEnabledFor(logging.DEBUG):
+                log.exception(error)
+            else:
+                log.error("Translation failed for segment %s (%s)",
+                          segment_identifier(s), type(error).__name__)
+            failure_codes: tuple[str, ...] = ()
+            if isinstance(error, TranslationIntegrityError):
+                failure_codes = error.failure_codes
+            elif isinstance(error, (FormulaPlaceholderError, TechnicalInvariantError,
+                                    TerminologyConsistencyError, VerifiedProperNameError)):
+                failure_codes = (IntegrityFailure.TECHNICAL_INVARIANT.value,)
+            record_unresolved = getattr(self.translator, "record_unresolved_identity", None)
+            if callable(record_unresolved):
+                record_unresolved(identity, type(error).__name__)
+            return s, "unresolved", type(error).__name__, failure_codes
 
     @property
     def image_only_pages(self) -> set[int]:
@@ -1674,107 +1811,12 @@ class TranslateConverter(PDFConverterEx):
                 with retry_identity_lock:
                     retried_identities.add(str(arguments[1]))
 
-        @retry(
-            wait=wait_exponential(multiplier=1, min=1, max=60),
-            stop=stop_after_attempt(8),
-            before_sleep=record_retry,
-            before=self.profile.retry_attempt,
-            sleep=self.profile.sleep,
-            reraise=True,
-        )
-        def request_translation(
-            s: str,
-            identity: str,
-            context: dict[str, object] | None,
-        ) -> str:
-            return self.translator.translate_with_identity(s, identity, context=context)
+        request_translation = self._make_translation_request(record_retry)
 
-        def translate_segment(
-            s: str,
-            identity: str,
-            context: dict[str, object] | None,
-        ) -> tuple[str, bool]:
-            preferred = preferred_translation(s, self.translator.lang_out)
-            if preferred is not None:
-                self.translator.validate(s, preferred)
-                if self.translator.name == "auto" and context is not None:
-                    decision = context.get("routing_decision")
-                    metadata = context.get("routing_metadata")
-                    if decision is not None and metadata is not None:
-                        self.translator.record_local_translation(
-                            identity, decision, metadata
-                        )
-                return preferred, True
-            encoded = encode_formula_placeholders(s)
-            translated = request_translation(encoded, identity, context)
-            return (
-                restore_formula_placeholders(s, translated),
-                self.translator.has_translation_for_identity(encoded, identity),
-            )
+        def worker(job):
+            source, identity, context, key = job
+            return self._translate_job(source, identity, context, key, request_translation)
 
-        def worker(
-            job: tuple[str, str, dict[str, str] | None]
-        ) -> tuple[str, str, str | None, tuple[str, ...]]:
-            s, identity, context = job
-            try:
-                if self.profile.plan_only:
-                    preferred = preferred_translation(s, self.translator.lang_out)
-                    if preferred is not None:
-                        self.translator.validate(s, preferred)
-                        if self.translator.name == "auto" and context is not None:
-                            self.translator.record_local_translation(
-                                identity, context["routing_decision"], context["routing_metadata"]
-                            )
-                        return preferred, "translated", None, ()
-                    planned = self.translator.plan_with_identity(
-                        encode_formula_placeholders(s), identity, context=context
-                    )
-                    if planned is not None:
-                        return restore_formula_placeholders(s, planned), "translated", None, ()
-                    return s, "unresolved", "PERFORMANCE_PLAN_ONLY", ()
-                translated, resolved = translate_segment(s, identity, context)
-                if not resolved:
-                    unresolved_reason = getattr(
-                        self.translator, "unresolved_reason_for_identity", None
-                    )
-                    reason = (
-                        unresolved_reason(identity)
-                        if callable(unresolved_reason)
-                        else "UnresolvedSegmentError"
-                    )
-                    return s, "unresolved", reason, ()
-                return translated, "translated", None, ()
-            except BaseException as e:
-                # A book is thousands of segments over tens of minutes, so one
-                # dead connection must not throw the whole document away. Keep
-                # the source text and let the caller report how much is missing.
-                if log.isEnabledFor(logging.DEBUG):
-                    log.exception(e)
-                else:
-                    log.error(
-                        "Translation failed for segment %s (%s)",
-                        segment_identifier(s),
-                        type(e).__name__,
-                    )
-                failure_codes: tuple[str, ...] = ()
-                if isinstance(e, TranslationIntegrityError):
-                    failure_codes = e.failure_codes
-                elif isinstance(
-                    e,
-                    (
-                        FormulaPlaceholderError,
-                        TechnicalInvariantError,
-                        TerminologyConsistencyError,
-                        VerifiedProperNameError,
-                    ),
-                ):
-                    failure_codes = (IntegrityFailure.TECHNICAL_INVARIANT.value,)
-                record_unresolved = getattr(
-                    self.translator, "record_unresolved_identity", None
-                )
-                if callable(record_unresolved):
-                    record_unresolved(identity, type(e).__name__)
-                return s, "unresolved", type(e).__name__, failure_codes
         # Counted here rather than inside worker: worker runs on the pool, and
         # "+= 1" from several threads drops updates.
         batch_token = self.profile.start("batch_build_seconds")
@@ -1883,8 +1925,8 @@ class TranslateConverter(PDFConverterEx):
                 executor.map(
                     worker,
                     (
-                        (source, identity, context)
-                        for source, _indices, identity, context in jobs.values()
+                        (source, identity, context, key)
+                        for key, (source, _indices, identity, context) in jobs.items()
                     ),
                 )
             )

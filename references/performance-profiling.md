@@ -1,7 +1,7 @@
-# Performance profiling (Patch D)
+# Performance profiling (Patch D and D2)
 
 Contents: execution modes; timer definitions; workload/cache/batches; benchmark
-workflow; acceptance and stopping conditions.
+workflow; acceptance and stopping conditions; D2 retry/cache policy.
 
 ## Execution modes
 
@@ -135,3 +135,60 @@ Use `PATCH_D_COMPLETE` only after all gates pass. Use
 none above the threshold; use `PATCH_D_PROVIDER_LATENCY_DOMINATED` only with
 measured external dominance. Otherwise use `PATCH_D_FAIL` and specify missing
 gates. Synthetic timing correctness alone cannot satisfy the real-PDF gates.
+
+## D2 typed retry and document negative cache
+
+`pdf2zh/retry_policy.py` defines the worker's Tenacity stop policy. The only
+current `SegmentTooLongError` raise is Google's length check before HTTP:
+one local evaluation, zero HTTP calls and zero sleeps. Post-provider
+`VerifiedProperNameError`, `TechnicalInvariantError`, `FormulaPlaceholderError`,
+`TranslationIntegrityError` and `TerminologyConsistencyError` use two total
+attempts with one 1-second wait. Unknown/transport exceptions retain eight
+attempts and waits 1, 2, 4, 8, 16, 32, 60. Classification uses exception types.
+The policy uses the terminal failure class and total Tenacity attempt number,
+as specified in D2; mixed failures do not have separate per-class ladders.
+
+One fresh `TranslateConverter` is created in each document's `translate_patch`
+call. Its `known_unsafe_identities` mapping and lock exist only for that run.
+Only an existing safe `("shared", source)` Google provider job without
+context-sensitive Korean or attached context can write the mapping, after
+terminal post-provider quality rejection. Store the first nonempty exception
+class reason with atomic `setdefault`. Read the reason atomically and return
+the ordinary unresolved result; the normal occurrence consumer records it
+once and the existing final script audit remains mandatory.
+
+Do not cache source-length checks, transport/internal errors, cancellations,
+occurrence/context-sensitive jobs, Handoff/MODEL_A or AUTO jobs, local preferred
+validation, post-request restoration, or fit/render/geometry failures.
+Positive cache reuse, worker ordering/concurrency, Patch A reconstruction,
+Patch B validators/accounting and Patch C routing remain their existing paths.
+The separate Handoff JSONL three-attempt workflow is unchanged.
+
+Additive profile workload counters are `content_quality_retry_attempts_capped`,
+`pre_provider_deterministic_retries_suppressed`, `negative_cache_skips` and
+`negative_cache_estimated_retry_backoff_seconds_saved`. The last counter is
+only **1 second of estimated retry backoff per skip** at the two-attempt
+budget; it is not measured wall-clock savings. Empty-reason rejection also
+increments a diagnostic counter. A quality error on legacy attempt 8 does not
+count as an earlier cap.
+
+For a no-PDF D2 check, run:
+
+```text
+<python> <skill-root>/scripts/run_patch_d2_no_pdf_checks.py
+<python> <skill-root>/scripts/benchmark_patch_d2_synthetic.py --output <separate-after.json> --compare-before <skill-root>/docs/patch-d2-synthetic-before.json --comparison-output <separate-comparison.json> --quality-recovery-probe
+```
+
+The runner selects 375 string/JSONL/ledger/geometry checks and guards PDF opening
+and live HTTP. The benchmark uses fixed fake Google responses, an injected
+clock and an isolated memory cache. Its comparison proves exact identity sets,
+occurrence outcomes and coverage only for that controlled workload.
+
+**D2 full acceptance is not established.** Real-document timing and identity
+comparison are `NOT_RUN` in the current no-PDF implementation. An offline
+counterexample also shows that a provider failing quality twice and succeeding
+on call 3 changes translated/unresolved membership under the cap. Treat the
+patch's universal outcome-preservation claim as `FAIL` for that probe; do not
+claim `PATCH_D2_PASS`, ship-ready status or a real PDF speedup. A repeated shared
+identity may likewise receive a different provider output later. See the
+[implementation evidence, fixtures, comparison and 17 acceptance gates](../docs/PATCH_D2_RETRY_NEGATIVE_CACHE.md).
