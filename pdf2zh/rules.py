@@ -42,7 +42,7 @@ IMMUTABLE_METADATA_PATTERNS = (
     re.compile(r"\b(?:19|20)\d{2}[.-]\s*\d{1,2}[.-]\s*\d{1,2}\b"),
     re.compile(r"\b(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\b"),
     re.compile(r"\b[A-Z]{2,}[A-Z0-9]*\d{2,}\b"),
-    re.compile(r"CONFIDENTIAL(?:\s+LG\s+Display\s+Co\.,?\s+Ltd)?(?:\s+\d{4})?", re.IGNORECASE),
+    re.compile(r"\bCONFIDENTIAL\b(?:\s+LG\s+Display\s+Co\.,?\s+Ltd)?(?:\s+\d{4})?", re.IGNORECASE),
 )
 MATH_FUNCTION_PATTERN = re.compile(
     r"(?<![A-Za-z])(?:sin|cos|tan|cot|sec|csc|log|ln|exp|min|max|lim|det|mod)(?![A-Za-z])",
