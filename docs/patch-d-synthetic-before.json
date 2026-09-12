@@ -1,0 +1,39 @@
+{
+  "workload": "synthetic strings; injected waits; in-memory isolated cache",
+  "real_pdf": false,
+  "live_provider": false,
+  "timer_case": {
+    "patch_wall_seconds": 0.04710460000205785,
+    "legacy_translation_seconds": 0.012995700002647936,
+    "legacy_layout_seconds": 0.034108899999409914,
+    "measured_local_work_seconds": 0.004141500001423992,
+    "measured_retry_sleep_seconds": 0.025971800001570955,
+    "request_attempts": 3,
+    "profile": null
+  },
+  "concurrent_timer_case": {
+    "patch_wall_seconds": 0.016231100002187304,
+    "provider_work_sum_seconds": 0.03061679999518674,
+    "legacy_layout_seconds": 0.0
+  },
+  "cache_cases": {
+    "cold-isolated": {
+      "result": "Thiết lập các tham số truyền thông.",
+      "google_cache_reads": 2,
+      "google_cache_writes": 1,
+      "handoff_cache_reads": 1,
+      "provider_requests": 1,
+      "google_cache_hits": 0,
+      "selected_route": "google"
+    },
+    "warm": {
+      "result": "Thiết lập các tham số truyền thông.",
+      "google_cache_reads": 1,
+      "google_cache_writes": 0,
+      "handoff_cache_reads": 0,
+      "provider_requests": 0,
+      "google_cache_hits": 1,
+      "selected_route": "google"
+    }
+  }
+}

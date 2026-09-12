@@ -28,6 +28,12 @@ Use the interpreter inside `<skill-root>/.venv`:
 
 ## Choose a mode
 
+For performance profiling or Patch D work, read
+[performance profiling](references/performance-profiling.md). Use measured
+timer boundaries before choosing an optimization. `--profile-only` still
+reads/processes the PDF locally; when the user forbids PDF processing, use only
+the synthetic string/JSONL fixtures and mark real-document gates `NOT_RUN`.
+
 | Mode | Translator | Use when |
 | --- | --- | --- |
 | Google (default) | `translate.google.com` | Books, batches, first drafts, or low token use |

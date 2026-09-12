@@ -3,6 +3,7 @@ import logging
 import math
 import re
 import threading
+import time
 import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -40,6 +41,7 @@ from pdf2zh.invariants import (
     is_executable_code_line,
     is_standalone_verified_proper_name,
 )
+from pdf2zh.performance import profile_from_env
 from pdf2zh.routing import RoutingMetadata, route_logical_unit
 from pdf2zh.rules import (
     COMMON_STANDALONE_TECHNICAL_TERM_PATTERN,
@@ -1107,6 +1109,8 @@ class TranslateConverter(PDFConverterEx):
         # Number of logical units for which the existing tenacity policy
         # scheduled at least one additional attempt.
         self.retry_units: int = 0
+        self.translation_wall_seconds = 0.0
+        self.profile = profile_from_env(envs)
         # Accounting uses the converter's actual paragraph segmentation. Every
         # entry in sstk is translated, deliberately preserved, or unresolved.
         self.extracted_segments: int = 0
@@ -1188,6 +1192,7 @@ class TranslateConverter(PDFConverterEx):
             )
 
     def receive_layout(self, ltpage: LTPage):
+        extraction_token = self.profile.start("extract_seconds")
         sstk: list[str] = []
         pstk: list[Paragraph] = []
         vbkt: int = 0
@@ -1560,6 +1565,8 @@ class TranslateConverter(PDFConverterEx):
         ############################################################
         log.debug("\n==========[SSTACK]==========\n")
 
+        self.profile.stop(extraction_token)
+        accounting_token = self.profile.start("coverage_accounting_seconds")
         source_span_ids: list[str | None] = []
         occurrence_ids: list[str | None] = []
         logical_unit_ids: list[str | None] = []
@@ -1651,6 +1658,10 @@ class TranslateConverter(PDFConverterEx):
                 )
             )
 
+        if self.profile.enabled:
+            self.profile.count("total_source_chars", sum(len(strip_style_tags(source)) for source in ledger_source_texts))
+        self.profile.stop(accounting_token)
+
         # Google throttles a long document, so back off instead of hammering it.
         # Roughly two minutes of patience per segment, then give up rather than
         # hang the run forever the way an unbounded retry used to.
@@ -1667,6 +1678,8 @@ class TranslateConverter(PDFConverterEx):
             wait=wait_exponential(multiplier=1, min=1, max=60),
             stop=stop_after_attempt(8),
             before_sleep=record_retry,
+            before=self.profile.retry_attempt,
+            sleep=self.profile.sleep,
             reraise=True,
         )
         def request_translation(
@@ -1704,6 +1717,21 @@ class TranslateConverter(PDFConverterEx):
         ) -> tuple[str, str, str | None, tuple[str, ...]]:
             s, identity, context = job
             try:
+                if self.profile.plan_only:
+                    preferred = preferred_translation(s, self.translator.lang_out)
+                    if preferred is not None:
+                        self.translator.validate(s, preferred)
+                        if self.translator.name == "auto" and context is not None:
+                            self.translator.record_local_translation(
+                                identity, context["routing_decision"], context["routing_metadata"]
+                            )
+                        return preferred, "translated", None, ()
+                    planned = self.translator.plan_with_identity(
+                        encode_formula_placeholders(s), identity, context=context
+                    )
+                    if planned is not None:
+                        return restore_formula_placeholders(s, planned), "translated", None, ()
+                    return s, "unresolved", "PERFORMANCE_PLAN_ONLY", ()
                 translated, resolved = translate_segment(s, identity, context)
                 if not resolved:
                     unresolved_reason = getattr(
@@ -1749,6 +1777,7 @@ class TranslateConverter(PDFConverterEx):
                 return s, "unresolved", type(e).__name__, failure_codes
         # Counted here rather than inside worker: worker runs on the pool, and
         # "+= 1" from several threads drops updates.
+        batch_token = self.profile.start("batch_build_seconds")
         translatable = sum(
             1
             for index, source in enumerate(sstk)
@@ -1794,7 +1823,7 @@ class TranslateConverter(PDFConverterEx):
                     source_fragment_ids=metadata.source_fragment_ids,
                 )
                 routing_metadata[index] = metadata
-                decision = route_logical_unit(
+                decision = self.profile.call("routing_seconds", route_logical_unit,
                     source,
                     metadata,
                     terminology=self.translator.terminology,
@@ -1812,6 +1841,8 @@ class TranslateConverter(PDFConverterEx):
                         metadata.logical_unit_id or str(index), decision, metadata
                     )
                 continue
+            if self.profile.enabled:
+                self.profile.count("provider_bound_chars", len(strip_style_tags(source)))
             key: tuple[str, object]
             handoff_context = (
                 bounded_korean_context(sstk, pstk, index)
@@ -1842,6 +1873,9 @@ class TranslateConverter(PDFConverterEx):
             jobs[key][1].append(index)
 
         self.unique_translation_units += len(jobs)
+        self.profile.stop(batch_token)
+        translation_started = time.perf_counter()
+        translation_token = self.profile.start("translation_wall_seconds")
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.thread
         ) as executor:
@@ -1854,6 +1888,9 @@ class TranslateConverter(PDFConverterEx):
                     ),
                 )
             )
+        self.translation_wall_seconds += time.perf_counter() - translation_started
+        self.profile.stop(translation_token)
+        batch_token = self.profile.start("batch_build_seconds")
         for (_source, indices, _identity, _context), outcome in zip(jobs.values(), job_results):
             for index in indices:
                 outcomes[index] = outcome
@@ -1864,7 +1901,9 @@ class TranslateConverter(PDFConverterEx):
         news = [translated for translated, _status, _reason, _codes in outcomes]
         if len(outcomes) != len(sstk):
             raise RuntimeError("segment accounting lost an extracted segment")
+        self.profile.stop(batch_token)
 
+        accounting_token = self.profile.start("coverage_accounting_seconds")
         for index, (target, outcome_status, unresolved_reason, failure_codes) in enumerate(
             outcomes
         ):
@@ -1925,6 +1964,10 @@ class TranslateConverter(PDFConverterEx):
                     failure_codes=occurrence.validation_failures,
                 )
                 news[index] = sstk[index]
+        self.profile.stop(accounting_token)
+        if self.profile.plan_only:
+            return ""
+        layout_token = self.profile.start("layout_seconds")
 
         ############################################################
         def raw_string(fcur: str, cstk: str):
@@ -2805,6 +2848,7 @@ class TranslateConverter(PDFConverterEx):
                 ops_list.append(gen_op_line(l.pts[0][0], l.pts[0][1], l.pts[1][0] - l.pts[0][0], l.pts[1][1] - l.pts[0][1], l.linewidth))
 
         ops = f"{white_rects}BT {''.join(ops_list)}ET "
+        self.profile.stop(layout_token)
         return ops
 
 

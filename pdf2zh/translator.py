@@ -35,6 +35,7 @@ from pdf2zh.invariants import (
     validate_technical_invariants,
     validate_verified_proper_names,
 )
+from pdf2zh.performance import profile_from_env
 from pdf2zh.routing import (
     RoutingDecision,
     RoutingMetadata,
@@ -276,6 +277,7 @@ class BaseTranslator:
         self.model = model
         self.ignore_cache = ignore_cache
         self.terminology = dict((envs or {}).get("terminology") or {})
+        self.profile = profile_from_env(envs)
         self.cache = TranslationCache(
             self.name,
             {
@@ -295,38 +297,51 @@ class BaseTranslator:
         with self._metrics_lock:
             self.cache_validation_failures += 1
 
+    def _get_cached(self, key: str) -> str | None:
+        cached = self.profile.call("cache_lookup_seconds", self.cache.get, key)
+        self.profile.count(f"{self.name}_cache_probes")
+        if cached is None:
+            self.profile.count(f"{self.name}_cache_misses")
+        return cached
+
+    def lookup_cache(self, text: str, ignore_cache: bool = False) -> tuple[str, str | None]:
+        """Probe using the unchanged cache policy and current validators."""
+        text = normalise_number_abbreviation(text)
+        if (self.ignore_cache or ignore_cache) or not is_safe_cache_key(text):
+            self.profile.count(f"{self.name}_cache_bypasses")
+            return "miss", None
+        cached = self._get_cached(text)
+        if cached is None:
+            return "miss", None
+        try:
+            self.validate(text, cached)
+        except (
+            FormulaPlaceholderError, TechnicalInvariantError, TerminologyConsistencyError,
+            TranslationIntegrityError, VerifiedProperNameError,
+        ):
+            self._record_cache_validation_failure()
+            self.profile.count(f"{self.name}_cache_misses")
+            logger.warning("Ignoring unsafe cached translation for segment %s", segment_identifier(text))
+            return "invalid", None
+        with self._metrics_lock:
+            self.cache_hits += 1
+        return "hit", cached
+
     def translate(self, text: str, ignore_cache: bool = False) -> str:
         """Translate text, consulting the persistent cache unless bypassed."""
         text = normalise_number_abbreviation(text)
         if is_standalone_verified_proper_name(text, self.terminology):
             return text
         use_cache = not (self.ignore_cache or ignore_cache) and is_safe_cache_key(text)
-        if use_cache:
-            cached = self.cache.get(text)
-            if cached is not None:
-                try:
-                    self.validate(text, cached)
-                except (
-                    FormulaPlaceholderError,
-                    TechnicalInvariantError,
-                    TerminologyConsistencyError,
-                    TranslationIntegrityError,
-                    VerifiedProperNameError,
-                ):
-                    self._record_cache_validation_failure()
-                    logger.warning(
-                        "Ignoring unsafe cached translation for segment %s",
-                        segment_identifier(text),
-                    )
-                else:
-                    with self._metrics_lock:
-                        self.cache_hits += 1
-                    return cached
+        cache_status, cached = self.lookup_cache(text, ignore_cache)
+        if cache_status == "hit":
+            return cached
         started = time.perf_counter()
         with self._metrics_lock:
             self.translation_requests += 1
         try:
-            provider_text, literal_masks = mask_provider_literals(text, self.terminology)
+            provider_text, literal_masks = self.profile.call("protection_seconds", mask_provider_literals,
+                                                            text, self.terminology)
             translated = self.do_translate(provider_text)
             translated = restore_provider_literals(translated, literal_masks)
         finally:
@@ -339,7 +354,7 @@ class BaseTranslator:
         return translated
 
     def validate(self, source: str, translated: str) -> None:
-        validate_translation_result(
+        self.profile.call("validation_seconds", validate_translation_result,
             source,
             translated,
             source_language=self.lang_in,
@@ -347,7 +362,27 @@ class BaseTranslator:
             terminology=self.terminology,
             translation_required=True,
         )
-        validate_confirmed_terminology(source, translated, self.terminology)
+        self.profile.call("validation_seconds", validate_confirmed_terminology,
+                          source, translated, self.terminology)
+
+    def plan_with_identity(self, text: str, identity: str, *, context=None) -> str | None:
+        """Use the same cache path, then record an estimate without contacting a provider."""
+        text = normalise_number_abbreviation(text)
+        if is_standalone_verified_proper_name(text, self.terminology):
+            return text
+        status, cached = self.lookup_cache(text)
+        if status == "hit":
+            return cached
+        provider_text, _masks = self.profile.call("protection_seconds", mask_provider_literals,
+                                                text, self.terminology)
+        capacity = getattr(self, "MAXIMUM_SEGMENT_CHARACTERS", None)
+        if capacity is not None and len(provider_text) > capacity:
+            self.profile.count(f"{self.name}_planned_oversized_units")
+        else:
+            self.profile.count(f"{self.name}_planned_units")
+            self.profile.count(f"{self.name}_planned_chars", len(provider_text))
+            self.profile.record_batch(f"{self.name}_planned", 1, len(provider_text), capacity)
+        return None
 
     def do_translate(self, text: str) -> str:
         """Translate one engine-sized text segment."""
@@ -431,7 +466,8 @@ class GoogleTranslator(BaseTranslator):
                 f"segment of {len(text)} characters exceeds the "
                 f"{self.MAXIMUM_SEGMENT_CHARACTERS} the service accepts"
             )
-        response = self.session.get(
+        self.profile.provider_request("google", len(text), self.MAXIMUM_SEGMENT_CHARACTERS)
+        response = self.profile.call("google_wait_seconds", self.session.get,
             self.endpoint,
             params={"tl": self.lang_out, "sl": self.lang_in, "q": text},
             headers=self.headers,
@@ -679,7 +715,7 @@ class HandoffTranslator(BaseTranslator):
             **kwargs,
         )
         envs = envs or {}
-        self.table, self.table_by_id = load_segment_tables(
+        self.table, self.table_by_id = self.profile.call("handoff_import_seconds", load_segment_tables,
             envs.get("segments_in"),
             source_language=self.lang_in,
             target_language=self.lang_out,
@@ -775,7 +811,7 @@ class HandoffTranslator(BaseTranslator):
                 self._resolved.add(identity or text)
             return translation
         if use_cache:
-            cached = self.cache.get(cache_key)
+            cached = self._get_cached(cache_key)
             if cached is not None:
                 try:
                     self.validate(text, cached)
@@ -787,6 +823,7 @@ class HandoffTranslator(BaseTranslator):
                     VerifiedProperNameError,
                 ):
                     self._record_cache_validation_failure()
+                    self.profile.count("handoff_cache_misses")
                     logger.warning(
                         "Ignoring unsafe cached handoff translation for segment %s",
                         segment_identifier(text),
@@ -799,6 +836,25 @@ class HandoffTranslator(BaseTranslator):
                     with self._lock:
                         self._resolved.add(identity or text)
                     return cached
+        return None
+
+    def plan_with_identity(self, text: str, identity: str, *, context=None) -> str | None:
+        if is_standalone_verified_proper_name(text, self.terminology):
+            return normalise_number_abbreviation(text)
+        result = self.lookup_existing(text, identity, raise_invalid_cache=True)
+        if result is not None:
+            return result
+        record = {"segment_id": identity, "src": normalise_number_abbreviation(text)}
+        if context and context.get("type") == "routing_context":
+            for name in ("logical_unit_id", "occurrence_id", "source_fragment_ids"):
+                if context.get(name):
+                    record[name] = context[name]
+            adjacent = context.get("handoff_context")
+        else:
+            adjacent = context
+        if adjacent and contains_hangul(text):
+            record["context"] = adjacent
+        self.profile.queue_handoff(record, planned=True)
         return None
 
     def do_translate(self, text: str) -> str:
@@ -832,6 +888,9 @@ class HandoffTranslator(BaseTranslator):
         context: dict[str, str] | None = None,
     ) -> None:
         """Append one untranslated segment, deduplicated, for the caller to fill in."""
+        self.profile.call("handoff_prepare_seconds", self._append_miss, text, identity, context)
+
+    def _append_miss(self, text: str, identity=None, context=None) -> None:
         with self._lock:
             miss_identity = identity or segment_identifier(text)
             if miss_identity in self._seen:
@@ -864,6 +923,7 @@ class HandoffTranslator(BaseTranslator):
                     and 0 < len(adjacent["text"]) <= 300
                 ):
                     record["context"] = adjacent
+                self.profile.queue_handoff(record)
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
@@ -889,6 +949,7 @@ class AutoTranslator(BaseTranslator):
         self.model = model
         self.ignore_cache = ignore_cache
         self.terminology = dict((envs or {}).get("terminology") or {})
+        self.profile = profile_from_env(envs)
         self.google = GoogleTranslator(
             lang_in,
             lang_out,
@@ -964,32 +1025,8 @@ class AutoTranslator(BaseTranslator):
                 }
             self._resolved.add(identity)
 
-    def translate_with_identity(
-        self,
-        text: str,
-        identity: str,
-        *,
-        context: dict[str, Any] | None = None,
-    ) -> str:
-        routing_context = context or {}
-        metadata = routing_context.get("routing_metadata")
-        if not isinstance(metadata, RoutingMetadata):
-            metadata = RoutingMetadata(logical_unit_id=identity)
-        decision = routing_context.get("routing_decision")
-        if not isinstance(decision, RoutingDecision):
-            decision = route_logical_unit(
-                text,
-                metadata,
-                terminology=self.terminology,
-                requested_engine="auto",
-            )
-        queue_context = {
-            "type": "routing_context",
-            "logical_unit_id": metadata.logical_unit_id or identity,
-            "occurrence_id": metadata.occurrence_id,
-            "source_fragment_ids": metadata.source_fragment_ids,
-            "handoff_context": routing_context.get("handoff_context"),
-        }
+    def _record_route(self, identity: str, decision: RoutingDecision,
+                      metadata: RoutingMetadata) -> None:
         with self._metrics_lock:
             if identity not in self._routing_traces:
                 self._counts["auto_units"] += 1
@@ -1004,6 +1041,79 @@ class AutoTranslator(BaseTranslator):
                     "occurrence_id": metadata.occurrence_id,
                     "source_fragment_ids": metadata.source_fragment_ids,
                 }
+
+    def plan_with_identity(self, text: str, identity: str, *, context=None) -> str | None:
+        """Follow route/cache precedence without making or enqueueing provider calls."""
+        context = context or {}
+        metadata = context.get("routing_metadata")
+        if not isinstance(metadata, RoutingMetadata):
+            metadata = RoutingMetadata(logical_unit_id=identity)
+        decision = context.get("routing_decision")
+        if not isinstance(decision, RoutingDecision):
+            decision = self.profile.call("routing_seconds", route_logical_unit, text, metadata,
+                                         terminology=self.terminology)
+        self._record_route(identity, decision, metadata)
+        with self._metrics_lock:
+            self._routing_traces[identity]["actual_provider"] = None
+            self._routing_traces[identity]["planned_provider"] = decision.selected_route.value
+        queue_context = {
+            "type": "routing_context", "logical_unit_id": metadata.logical_unit_id or identity,
+            "occurrence_id": metadata.occurrence_id, "source_fragment_ids": metadata.source_fragment_ids,
+            "handoff_context": context.get("handoff_context"),
+        }
+        if decision.selected_route == SelectedRoute.PRESERVE:
+            return text
+        if decision.selected_route == SelectedRoute.HANDOFF:
+            return self.handoff.plan_with_identity(text, identity, context=queue_context)
+        status, cached = self._google_cache_lookup(text)
+        if status == "hit":
+            return cached
+        if status == "invalid":
+            self._record_google_validation_failure(identity)
+            self._mark_escalation(identity)
+            with self._metrics_lock:
+                self._routing_traces[identity]["actual_provider"] = None
+                self._routing_traces[identity]["planned_provider"] = "handoff"
+            return self.handoff.plan_with_identity(text, identity, context=queue_context)
+        try:
+            existing = self.handoff.lookup_existing(text, identity, raise_invalid_cache=True)
+        except (FormulaPlaceholderError, TechnicalInvariantError, TerminologyConsistencyError,
+                TranslationIntegrityError, VerifiedProperNameError):
+            self._record_handoff_validation_failure(identity)
+            existing = None
+        if existing is not None:
+            with self._metrics_lock:
+                self._routing_traces[identity]["cached_provider"] = "handoff"
+            return existing
+        return self.google.plan_with_identity(text, identity)
+
+    def translate_with_identity(
+        self,
+        text: str,
+        identity: str,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> str:
+        routing_context = context or {}
+        metadata = routing_context.get("routing_metadata")
+        if not isinstance(metadata, RoutingMetadata):
+            metadata = RoutingMetadata(logical_unit_id=identity)
+        decision = routing_context.get("routing_decision")
+        if not isinstance(decision, RoutingDecision):
+            decision = self.profile.call("routing_seconds", route_logical_unit,
+                text,
+                metadata,
+                terminology=self.terminology,
+                requested_engine="auto",
+            )
+        queue_context = {
+            "type": "routing_context",
+            "logical_unit_id": metadata.logical_unit_id or identity,
+            "occurrence_id": metadata.occurrence_id,
+            "source_fragment_ids": metadata.source_fragment_ids,
+            "handoff_context": routing_context.get("handoff_context"),
+        }
+        self._record_route(identity, decision, metadata)
         if decision.selected_route == SelectedRoute.HANDOFF:
             return self._handoff_result(text, identity, queue_context)
         if decision.selected_route == SelectedRoute.PRESERVE:
@@ -1017,27 +1127,7 @@ class AutoTranslator(BaseTranslator):
         return self._google_result(text, identity, queue_context)
 
     def _google_cache_lookup(self, text: str) -> tuple[str, str | None]:
-        normalized = normalise_number_abbreviation(text)
-        use_cache = not self.google.ignore_cache and is_safe_cache_key(normalized)
-        if not use_cache:
-            return "miss", None
-        cached = self.google.cache.get(normalized)
-        if cached is None:
-            return "miss", None
-        try:
-            self.google.validate(normalized, cached)
-        except (
-            FormulaPlaceholderError,
-            TechnicalInvariantError,
-            TerminologyConsistencyError,
-            TranslationIntegrityError,
-            VerifiedProperNameError,
-        ):
-            self.google._record_cache_validation_failure()
-            return "invalid", None
-        with self.google._metrics_lock:
-            self.google.cache_hits += 1
-        return "hit", cached
+        return self.google.lookup_cache(text)
 
     def _google_result(
         self, text: str, identity: str, queue_context: dict[str, Any]
@@ -1097,13 +1187,16 @@ class AutoTranslator(BaseTranslator):
     def _escalate(
         self, text: str, identity: str, queue_context: dict[str, Any]
     ) -> str:
+        self._mark_escalation(identity)
+        return self._handoff_result(text, identity, queue_context)
+
+    def _mark_escalation(self, identity: str) -> None:
         with self._metrics_lock:
             if identity not in self._escalated_identities:
                 self._escalated_identities.add(identity)
                 self._counts["google_to_handoff_escalations"] += 1
                 self._counts["google_to_handoff_escalated_this_run"] += 1
             self._routing_traces[identity]["actual_provider"] = "handoff"
-        return self._handoff_result(text, identity, queue_context)
 
     def _handoff_result(
         self, text: str, identity: str, queue_context: dict[str, Any]

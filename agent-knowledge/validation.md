@@ -2,6 +2,13 @@
 
 ## Automated Gate
 
+For Patch D, follow [performance profiling](../references/performance-profiling.md)
+for timer meanings and cache isolation. If the user forbids PDF processing,
+replace PDF suites/render QA with explicitly selected pure string/JSONL tests;
+do not run discovery or `--profile-only`. Mark real-document acceptance gates
+`NOT_RUN`. Profiling correctness and synthetic overhead are separate from PDF
+performance/layout acceptance.
+
 Run from the repository root with the platform virtual environment:
 
 ```text

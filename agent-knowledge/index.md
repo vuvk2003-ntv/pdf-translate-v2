@@ -25,6 +25,7 @@ here and must be updated with the code that changes it.
 | Navigate or modify the repository | [repository.md](repository.md) |
 | Change translation/layout behavior | [pdf-engine.md](pdf-engine.md) and [regressions.md](regressions.md) |
 | Diagnose or deliver a PDF | [validation.md](validation.md) and the relevant regression entries |
+| Profile performance / Patch D | [performance profiling](../references/performance-profiling.md) |
 | Build, merge, or publish | [release.md](release.md) and [validation.md](validation.md) |
 | Build or release the Android app | [android.md](android.md) |
 

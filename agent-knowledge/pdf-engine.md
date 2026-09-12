@@ -2,6 +2,14 @@
 
 ## Pipeline
 
+Optional `pdf2zh/performance.py` profiles exclusive stage boundaries with
+per-thread stacks. Layout no longer subtracts summed provider request time
+from elapsed patch time; it excludes the whole translation-pool wait.
+`--profile-only` follows existing reconstruction/routing/cache planning and
+stops before provider calls and final native output. It still processes PDFs.
+See [performance profiling](../references/performance-profiling.md) for report
+definitions, benchmark isolation and acceptance limits.
+
 1. `scripts/translate_pdf.py` validates a text-based PDF and stages output.
 2. `pdf2zh/high_level.py` loads fonts/model, predicts layout, matches tables,
    detects preserved structures, patches pages, and serializes the mono PDF.

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from pdf2zh.handoff import (  # noqa: E402
     load_terminology,
     write_jsonl,
 )
+from pdf2zh.performance import PerformanceProfile  # noqa: E402
 
 
 def _positive(value: str) -> int:
@@ -43,11 +46,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-segments", type=_positive, default=30)
     parser.add_argument("--max-characters", type=_positive, default=12_000)
     parser.add_argument("--attempt", type=_positive, default=1)
+    parser.add_argument("--profile-performance", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    profile = PerformanceProfile(enabled=args.profile_performance)
+    started = time.perf_counter() if profile.enabled else 0.0
+
+    def emit_profile(batches):
+        if not profile.enabled:
+            return
+        for batch in batches:
+            records = batch["segments"]
+            characters = sum(len(r["src"]) + len(r.get("context", {}).get("text", ""))
+                             for r in records)
+            profile.record_batch("handoff_prepared", len(records), characters, args.max_characters)
+        print(json.dumps(profile.snapshot(total_seconds=time.perf_counter() - started),
+                         ensure_ascii=True))
     batch_path = args.output_batches if args.translations is None else args.retry_batches
     if batch_path is not None:
         args.oversized = args.oversized or batch_path.with_suffix(".oversized.jsonl")
@@ -57,8 +74,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if any(output == other or (output.exists() and other.exists() and output.samefile(other))
                for other in inputs + outputs[:index]):
             raise SystemExit(f"Output aliases an input or another output: {output}")
-    sources = load_source_segments(args.segments.expanduser().resolve())
-    terminology = load_terminology(
+    sources = profile.call("handoff_import_seconds", load_source_segments, args.segments.expanduser().resolve())
+    terminology = profile.call("handoff_import_seconds", load_terminology,
         args.terminology.expanduser().resolve() if args.terminology else None
     )
     if args.attempt > MAX_RETRY_ATTEMPTS:
@@ -68,7 +85,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.output_batches is None:
             raise SystemExit("--output-batches is required when preparing batches")
         oversized = []
-        batches = build_handoff_batches(
+        batches = profile.call("handoff_prepare_seconds", build_handoff_batches,
             sources,
             terminology=terminology,
             max_segments=args.max_segments,
@@ -83,11 +100,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Prepared {len(sources) - len(oversized)} unique translation units in {len(batches)} batches; "
             f"oversized={len(oversized)} ({oversized_path})"
         )
+        emit_profile(batches)
         return 0
 
     if args.accepted is None or args.retry_batches is None:
         raise SystemExit("--accepted and --retry-batches are required for validation")
-    assessment = assess_handoff_translations(
+    assessment = profile.call("handoff_import_seconds", assess_handoff_translations,
         sources,
         args.translations.expanduser().resolve(),
         terminology=terminology,
@@ -97,7 +115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     oversized = []
     exhausted = bool(assessment.retry) and args.attempt >= MAX_RETRY_ATTEMPTS
     if not exhausted:
-        retries = build_handoff_batches(
+        retries = profile.call("handoff_prepare_seconds", build_handoff_batches,
             assessment.retry,
             terminology=terminology,
             max_segments=args.max_segments,
@@ -115,6 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"retry={len(assessment.retry)}, retry_batches={len(retries)}, "
         f"exhausted={int(exhausted)}, oversized={len(oversized)} ({oversized_path})"
     )
+    emit_profile(retries)
     return 3 if exhausted else 0
 
 

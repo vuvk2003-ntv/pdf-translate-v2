@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -147,6 +148,8 @@ class Translation(NamedTuple):
     escalation_ratio: float = 0.0
     routing_traces: tuple[dict[str, object], ...] = ()
     translation_seconds: float = 0.0
+    translation_wall_seconds: float = 0.0
+    performance_profile: Mapping[str, object] = MappingProxyType({})
     prepare_seconds: float = 0.0
     layout_seconds: float = 0.0
     render_seconds: float = 0.0
@@ -325,10 +328,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ignore-cache", action="store_true")
     parser.add_argument("--terminology", type=Path, help="confirmed terminology JSON; scopes cache validity")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--profile-performance", action="store_true")
+    parser.add_argument("--profile-only", action="store_true",
+                        help="Read and plan the PDF locally; no provider, queue output, or rendering")
+    parser.add_argument("--performance-report", type=Path)
+    parser.add_argument("--cache-mode-label", choices=("production", "cold-isolated", "warm"),
+                        default="production", help="Measurement label only; does not reset or isolate cache")
     return parser
 
 
 def _validate_arguments(args: argparse.Namespace) -> None:
+    if args.profile_only:
+        if args.output_dir is not None or args.emit_segments is not None:
+            raise TranslationError("--profile-only cannot write a PDF or --emit-segments")
+        return
     if args.output_dir is None and args.emit_segments is None:
         raise TranslationError("--output-dir is required unless --emit-segments is given")
     if args.engine == "handoff":
@@ -722,12 +735,23 @@ def translate_pdf(
     emit_segments: Path | None = None,
     terminology: Path | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    profile_performance: bool = False,
+    profile_only: bool = False,
+    cache_mode_label: str = "production",
 ) -> Translation:
     """Translate one PDF, reporting any segments the engine could not translate."""
     if engine not in ENGINES:
         raise TranslationError(
             f"Unsupported translation engine {engine!r}; expected one of: {', '.join(ENGINES)}"
         )
+    if profile_only and (output_dir is not None or emit_segments is not None):
+        raise TranslationError("profile_only cannot write a PDF or pending segments")
+    from pdf2zh.performance import PerformanceProfile
+
+    profile = PerformanceProfile(enabled=profile_performance or profile_only,
+                                 plan_only=profile_only, cache_mode=cache_mode_label)
+    started = time.perf_counter() if profile.enabled else 0.0
+    prepare_token = profile.start("prepare_seconds")
     core_identity = _require_core()
     source = _validate_input(input_pdf)
     source_facts = _pdf_facts(source, role="source")
@@ -750,6 +774,7 @@ def translate_pdf(
         except (OSError, ValueError) as error:
             raise TranslationError(f"Cannot load terminology: {terminology}: {error}") from error
     envs: dict[str, object] = dict(_segment_envs(segments, emit_segments, protected_paths))
+    envs["performance_profile"] = profile
     if terms is not None:
         envs["terminology"] = terms
     confidentiality_markers = _detect_confidentiality_markers(source, pages)
@@ -785,8 +810,9 @@ def translate_pdf(
                 for page_index in range(source_facts.page_count)
             )
             envs["page_identity"] = expected_page_ids
+        profile.stop(prepare_token)
         try:
-            report = _run_engine(
+            report = profile.call("prepare_seconds", _run_engine,
                 source,
                 temp_output,
                 target_language,
@@ -805,8 +831,8 @@ def translate_pdf(
             _require_source_unchanged(source, source_facts.sha256)
             raise TranslationError(f"PDF translation core failed: {_describe(error)}") from error
 
-        _require_source_unchanged(source, source_facts.sha256)
-        runtime_after = _require_core()
+        profile.call("final_qa_seconds", _require_source_unchanged, source, source_facts.sha256)
+        runtime_after = profile.call("final_qa_seconds", _require_core)
         if runtime_after != core_identity:
             raise TranslationError("Bundled PDF core identity changed during the run")
 
@@ -825,6 +851,10 @@ def translate_pdf(
         untranslated = report.unresolved_occurrences
         image_only = tuple(sorted(report.image_only_pages))
         if destination is None:
+            if profile.enabled:
+                report = replace(report, performance_profile=profile.snapshot(
+                    total_seconds=time.perf_counter() - started,
+                    translation_seconds=report.translation_seconds))
             return Translation(
                 path=None,
                 untranslated=untranslated,
@@ -923,6 +953,8 @@ def translate_pdf(
                 escalation_ratio=report.escalation_ratio,
                 routing_traces=report.routing_traces,
                 translation_seconds=report.translation_seconds,
+                translation_wall_seconds=report.translation_wall_seconds,
+                performance_profile=report.performance_profile,
                 prepare_seconds=report.prepare_seconds,
                 layout_seconds=report.layout_seconds,
                 render_seconds=report.render_seconds,
@@ -950,6 +982,7 @@ def translate_pdf(
                 raise TranslationError(f"Engine did not produce one translated PDF; found: {names}")
             generated = candidates[0]
 
+        qa_token = profile.start("final_qa_seconds")
         candidate_facts = _pdf_facts(generated, role="generated candidate")
         _validate_candidate(source_facts, candidate_facts, expected_page_ids)
         report = _audit_final_output_text_layer(
@@ -1011,6 +1044,11 @@ def translate_pdf(
             raise TranslationError(
                 "Final PDF hash does not match the validated generated candidate"
             )
+        profile.stop(qa_token)
+        if profile.enabled:
+            report = replace(report, performance_profile=profile.snapshot(
+                total_seconds=time.perf_counter() - started,
+                translation_seconds=report.translation_seconds))
 
     return Translation(
         path=destination,
@@ -1100,6 +1138,8 @@ def translate_pdf(
         escalation_ratio=report.escalation_ratio,
         routing_traces=report.routing_traces,
         translation_seconds=report.translation_seconds,
+        translation_wall_seconds=report.translation_wall_seconds,
+        performance_profile=report.performance_profile,
         prepare_seconds=report.prepare_seconds,
         layout_seconds=report.layout_seconds,
         render_seconds=report.render_seconds,
@@ -1144,6 +1184,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         _validate_arguments(args)
+        if args.performance_report is not None:
+            report_path = args.performance_report.expanduser().resolve()
+            protected = [p.expanduser().resolve() for p in
+                         (args.input_pdf, args.segments, args.emit_segments, args.terminology)
+                         if p is not None]
+            if args.output_dir is not None:
+                protected.append(args.output_dir.expanduser().resolve() /
+                                 f"{args.input_pdf.stem}-{args.target_language}.pdf")
+            if report_path.suffix.lower() != ".json":
+                raise TranslationError("--performance-report must use a .json path")
+            if any(report_path == p or (report_path.exists() and p.exists() and report_path.samefile(p))
+                   for p in protected):
+                raise TranslationError("Performance report aliases a source or output")
         result = translate_pdf(
             args.input_pdf,
             args.output_dir,
@@ -1157,10 +1210,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             segments=args.segments,
             emit_segments=args.emit_segments,
             terminology=args.terminology,
+            profile_performance=args.profile_performance or args.performance_report is not None,
+            profile_only=args.profile_only,
+            cache_mode_label=args.cache_mode_label,
         )
     except TranslationError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+    if result.performance_profile.get("enabled"):
+        payload = json.dumps(dict(result.performance_profile), ensure_ascii=False, indent=2) + "\n"
+        if args.performance_report is not None:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(payload, encoding="utf-8")
+        else:
+            print(payload, end="")
     if result.path is not None:
         label = "Translated PDF" if result.delivery_status == "SUCCESS" else "Partial PDF"
         print(f"{label}: {result.path}")

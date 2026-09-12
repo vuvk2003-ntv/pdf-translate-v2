@@ -1,0 +1,164 @@
+{
+  "workload": "synthetic strings; injected waits; in-memory isolated cache",
+  "real_pdf": false,
+  "live_provider": false,
+  "timer_case": {
+    "patch_wall_seconds": 0.047563400003127754,
+    "legacy_translation_seconds": 0.01396000000386266,
+    "legacy_layout_seconds": 0.03360339999926509,
+    "measured_local_work_seconds": 0.0040317999955732375,
+    "measured_retry_sleep_seconds": 0.024830899994412903,
+    "request_attempts": 3,
+    "profile": {
+      "enabled": true,
+      "cache_mode": "cold-isolated",
+      "plan_only": false,
+      "timing_basis": "exclusive per thread; worker time summed; translation_wall overlaps worker stages",
+      "layout_excludes_provider_wait_and_retry": true,
+      "legacy_translation_seconds_is_request_time_sum": true,
+      "handoff_execution_model": "MODEL_A",
+      "handoff_external_wait_measured": false,
+      "timings": {
+        "prepare_seconds": 0.0,
+        "extract_seconds": 0.0,
+        "protection_seconds": 0.0001303000026382506,
+        "reconstruction_seconds": 0.0,
+        "coverage_accounting_seconds": 0.0,
+        "routing_seconds": 0.0,
+        "cache_lookup_seconds": 2.459999086568132e-05,
+        "batch_build_seconds": 0.0,
+        "google_wait_seconds": 0.013706099998671561,
+        "handoff_prepare_seconds": 0.0,
+        "handoff_wait_seconds": 0.0,
+        "handoff_import_seconds": 0.0,
+        "retry_seconds": 0.024757600003795233,
+        "layout_seconds": 0.004044399996928405,
+        "render_seconds": 0.0,
+        "final_qa_seconds": 0.0,
+        "validation_seconds": 0.001723500005027745,
+        "translation_wall_seconds": 0.016879399998288136,
+        "total_seconds": 0.047563400003127754,
+        "translation_seconds": 0.01396000000386266
+      },
+      "workload": {
+        "google_cache_probes": 3,
+        "google_cache_misses": 3,
+        "google_units_sent": 3,
+        "google_chars_sent": 99,
+        "google_http_requests": 3,
+        "retry_requests": 2,
+        "source_pages": 0,
+        "raw_text_spans": 0,
+        "candidate_fragments": 0,
+        "logical_units": 0,
+        "provider_bound_units": 0,
+        "total_source_chars": 0,
+        "provider_bound_chars": 0,
+        "translated_occurrences": 0,
+        "allowed_preserve_occurrences": 0,
+        "unresolved_occurrences": 0,
+        "preserve_routed_units": 0,
+        "google_routed_units": 0,
+        "handoff_direct_units": 0,
+        "google_to_handoff_escalations": 0,
+        "handoff_provider_batches_or_requests": 0,
+        "retry_units": 0,
+        "google_cache_hits": 0,
+        "google_provider_requests": 0,
+        "handoff_cache_hits": 0,
+        "handoff_cache_misses": 0,
+        "handoff_provider_requests": 0,
+        "handoff_units_sent": 0,
+        "handoff_chars_sent": 0
+      },
+      "batches": {
+        "google": {
+          "batch_count": 3,
+          "units_per_batch_average": 1.0,
+          "units_per_batch_median": 1.0,
+          "chars_per_batch_average": 33.0,
+          "chars_per_batch_median": 33.0,
+          "chars_per_batch_p50": 33.0,
+          "chars_per_batch_p90": 33.0,
+          "chars_per_batch_p99": 33.0,
+          "chars_per_batch_max": 33,
+          "batch_capacity_utilization": 0.0066,
+          "character_capacity": 5000
+        }
+      },
+      "stage_shares": {
+        "prepare_seconds": 0.0,
+        "extract_seconds": 0.0,
+        "protection_seconds": 0.0027395014366021373,
+        "reconstruction_seconds": 0.0,
+        "coverage_accounting_seconds": 0.0,
+        "routing_seconds": 0.0,
+        "cache_lookup_seconds": 0.0005172042129886348,
+        "batch_build_seconds": 0.0,
+        "google_wait_seconds": 0.2881648493961797,
+        "handoff_prepare_seconds": 0.0,
+        "handoff_wait_seconds": 0.0,
+        "handoff_import_seconds": 0.0,
+        "retry_seconds": 0.5205178772368498,
+        "layout_seconds": 0.08503176805405935,
+        "render_seconds": 0.0,
+        "final_qa_seconds": 0.0,
+        "validation_seconds": 0.036235845312034214,
+        "translation_wall_seconds": 0.3548821151805412
+      },
+      "retry": {
+        "sleep_count": 2,
+        "retry_seconds": 0.024757600003795233,
+        "average_retry_seconds": 0.012378800001897616,
+        "max_retry_seconds": 0.012422500003594905
+      },
+      "index_memory_bytes": 0,
+      "batch_histogram_memory_bytes": 592
+    }
+  },
+  "concurrent_timer_case": {
+    "patch_wall_seconds": 0.016388199997891206,
+    "provider_work_sum_seconds": 0.03052600000228267,
+    "legacy_layout_seconds": 0.0
+  },
+  "cache_cases": {
+    "cold-isolated": {
+      "result": "Thiết lập các tham số truyền thông.",
+      "google_cache_reads": 2,
+      "google_cache_writes": 1,
+      "handoff_cache_reads": 1,
+      "provider_requests": 1,
+      "google_cache_hits": 0,
+      "selected_route": "google"
+    },
+    "warm": {
+      "result": "Thiết lập các tham số truyền thông.",
+      "google_cache_reads": 1,
+      "google_cache_writes": 0,
+      "handoff_cache_reads": 0,
+      "provider_requests": 0,
+      "google_cache_hits": 1,
+      "selected_route": "google"
+    }
+  },
+  "instrumentation_overhead": {
+    "workload": "100 injected 5ms waits; one batch/two stage boundaries per wait; 3 alternating trials",
+    "trials_seconds": {
+      "disabled": [
+        0.5267702000055579,
+        0.5265281999963918,
+        0.5333345000035479
+      ],
+      "enabled": [
+        0.5398118000011891,
+        0.5340550000037183,
+        0.5327624999990803
+      ]
+    },
+    "disabled_median_seconds": 0.5267702000055579,
+    "enabled_median_seconds": 0.5340550000037183,
+    "observed_delta_fraction": 0.013829180158793308,
+    "real_pdf_overhead_verified": false,
+    "interpretation": "synthetic scheduling noise included; no production <1% assertion"
+  }
+}

@@ -32,6 +32,7 @@ from pdf2zh.doclayout import OnnxModel
 from pdf2zh.integrity import Occurrence
 from pdf2zh.logical_units import ReconstructionMetrics
 from pdf2zh.pdfinterp import PDFPageInterpreterEx
+from pdf2zh.performance import profile_from_env
 from pdf2zh.rules import (
     anchored_prose_bounds,
     anchored_translatable_lines,
@@ -213,6 +214,8 @@ class TranslationReport:
     escalation_ratio: float = 0.0
     routing_traces: tuple[dict[str, Any], ...] = ()
     translation_seconds: float = 0.0
+    translation_wall_seconds: float = 0.0
+    performance_profile: dict[str, Any] = field(default_factory=dict)
     prepare_seconds: float = 0.0
     layout_seconds: float = 0.0
     render_seconds: float = 0.0
@@ -457,6 +460,11 @@ def translate_patch(
     synthetic_styles: set[int] | None = None,
     **kwarg: Any,
 ) -> None:
+    profile = profile_from_env(envs)
+
+    def reconstruct(*args, **kwargs):
+        return profile.call("reconstruction_seconds", group_translatable_line_clusters, *args, **kwargs)
+
     rsrcmgr = PDFResourceManager()
     layout = {}
     layout_bounds = {}
@@ -500,8 +508,8 @@ def translate_patch(
     else:
         total_pages = doc_zh.page_count
 
-    parser = PDFParser(inf)
-    doc = PDFDocument(parser)
+    parser = profile.call("extract_seconds", PDFParser, inf)
+    doc = profile.call("extract_seconds", PDFDocument, parser)
     with tqdm.tqdm(total=total_pages) as progress:
         for pageno, page in enumerate(PDFPage.create_pages(doc)):
             if cancellation_event and cancellation_event.is_set():
@@ -514,7 +522,7 @@ def translate_patch(
             page.pageno = pageno
             page_rect = doc_zh[page.pageno].rect
             page_area = page_rect.width * page_rect.height
-            page_blocks = doc_zh[page.pageno].get_text("dict")["blocks"]
+            page_blocks = profile.call("extract_seconds", doc_zh[page.pageno].get_text, "dict")["blocks"]
             if is_scanned_page(page_blocks, page_area):
                 scanned_pages.add(pageno)
             if page_has_image(page_blocks):
@@ -590,9 +598,10 @@ def translate_patch(
             page_logical_classes = logical_classes.setdefault(page.pageno, {})
             page_height = float(page_rect.height)
             page_words = upright_table_words(
-                source_page.get_text("words", sort=True),
-                source_page.get_text("dict")["blocks"],
+                profile.call("extract_seconds", source_page.get_text, "words", sort=True),
+                profile.call("extract_seconds", source_page.get_text, "dict")["blocks"],
             )
+            protection_token = profile.start("protection_seconds")
             for table_bounds in model_table_bounds:
                 for cell in matching_table_cells(table_bounds, detected_tables):
                     cx0 = max(float(cell[0]), table_bounds[0])
@@ -641,7 +650,7 @@ def translate_patch(
             # converter can reflow them. A one-point pad catches their rules and
             # small subscripts without swallowing adjacent prose.
             fallback_formulas = formula_regions(
-                source_page.get_text("blocks", sort=True),
+                profile.call("extract_seconds", source_page.get_text, "blocks", sort=True),
                 page_words,
                 stacked_exclusions=model_table_bounds,
             )
@@ -654,7 +663,7 @@ def translate_patch(
                 )
                 box[by0:by1, bx0:bx1] = 0
 
-            page_text = source_page.get_text("text")
+            page_text = profile.call("extract_seconds", source_page.get_text, "text")
             preservation = classify_preserved_page(page_text)
             if preservation is not None:
                 logger.info(
@@ -673,7 +682,7 @@ def translate_patch(
             # header/footer/abandon region, or structural page. Reliable cells
             # above keep their existing bounds and fitting behavior on ordinary
             # pages. Every recovered line receives one class and one fixed bound.
-            anchor_blocks = source_page.get_text("dict")["blocks"]
+            anchor_blocks = profile.call("extract_seconds", source_page.get_text, "dict")["blocks"]
             reconstruction.raw_text_spans += sum(
                 len(line.get("spans", ()))
                 for block in anchor_blocks
@@ -687,7 +696,7 @@ def translate_patch(
                 if (bounds := upright_line_bounds(line)) is not None
             ]
             anchor_barriers = []
-            for drawing in source_page.get_drawings():
+            for drawing in profile.call("extract_seconds", source_page.get_drawings):
                 for item in drawing["items"]:
                     if item[0] == "l":
                         a,b = item[1:3]
@@ -727,7 +736,7 @@ def translate_patch(
                         if original_class == 1
                         else ("layout", original_class)
                     )
-                    for group in group_translatable_line_clusters(
+                    for group in reconstruct(
                         class_anchors,
                         barriers=anchor_barriers,
                         page=page.pageno,
@@ -807,7 +816,7 @@ def translate_patch(
                 anchors_with_parents = [
                     (anchor, parent)
                     for parent, parent_anchors in anchors_by_parent.items()
-                    for anchor in group_translatable_line_clusters(
+                    for anchor in reconstruct(
                         parent_anchors,
                         barriers=anchor_barriers,
                         page=page.pageno,
@@ -824,7 +833,7 @@ def translate_patch(
                 anchors_with_parents = [
                     (unit, None)
                     for index, anchor in enumerate(structural_anchors)
-                    for unit in group_translatable_line_clusters(
+                    for unit in reconstruct(
                         [anchor],
                         page=page.pageno,
                         region_id=("structural", index),
@@ -881,7 +890,7 @@ def translate_patch(
             # Reapply exact metadata after carving translatable labels out
             # of protected header/footer regions. Character-level rectangles
             # preserve values without freezing Korean wording beside them.
-            raw_blocks = source_page.get_text("rawdict")["blocks"]
+            raw_blocks = profile.call("extract_seconds", source_page.get_text, "rawdict")["blocks"]
             for metadata in immutable_metadata_regions(raw_blocks):
                 mx0, my0, mx1, my1 = metadata.bbox
                 # These syntax patterns describe headers, footers and title
@@ -901,6 +910,7 @@ def translate_patch(
                 )
                 box[py0:py1, px0:px1] = 0
 
+            profile.stop(protection_token)
             layout[page.pageno] = box
             if pageno in scanned_pages:
                 device.scanned_pages.add(pageno)
@@ -910,7 +920,7 @@ def translate_patch(
             doc_zh.update_object(page.page_xref, "<<>>")
             doc_zh.update_stream(page.page_xref, b"")
             doc_zh[page.pageno].set_contents(page.page_xref)
-            interpreter.process_page(page)
+            profile.call("extract_seconds", interpreter.process_page, page)
             # Atomic page-level fallback can replay glyphs from several Form
             # XObjects. Expose those existing font objects to the page stream
             # under collision-resistant aliases chosen by the converter.
@@ -935,6 +945,7 @@ def translate_patch(
             > int(metrics.get("handoff_unresolved_units", 0))
         ):
             raise RuntimeError("pending Handoff units exceed unresolved Handoff units")
+    accounting_token = profile.start("coverage_accounting_seconds")
     integrity = device.integrity_ledger.reconcile(
         cache_validation_failures=int(metrics.get("cache_validation_failures", 0))
     )
@@ -960,6 +971,26 @@ def translate_patch(
     unit_char_counts = device.logical_unit_char_counts
     auto_units = int(metrics.get("auto_units", 0))
     google_routed_units = int(metrics.get("google_routed_units", 0))
+    profile.set_workload({
+        "raw_text_spans": reconstruction.raw_text_spans,
+        "candidate_fragments": reconstruction.candidate_fragments,
+        "logical_units": device.extracted_segments,
+        "provider_bound_units": device.translatable_segments,
+        "translated_occurrences": translated_segments,
+        "allowed_preserve_occurrences": preserved_segments,
+        "unresolved_occurrences": unresolved_segments,
+        "preserve_routed_units": int(metrics.get("preserve_routed_units", 0)),
+        "google_routed_units": google_routed_units,
+        "handoff_direct_units": int(metrics.get("handoff_direct_units", 0)),
+        "google_to_handoff_escalations": int(metrics.get("google_to_handoff_escalations", 0)),
+        "google_cache_hits": int(metrics.get("google_cache_hits", metrics.get("cache_hits", 0) if service == "google" else 0)),
+        "handoff_cache_hits": int(metrics.get("handoff_cache_hits", metrics.get("cache_hits", 0) if service == "handoff" else 0)),
+        "google_provider_requests": int(metrics.get("google_provider_requests", metrics.get("translation_requests", 0) if service == "google" else 0)),
+        "handoff_provider_batches_or_requests": 0,
+        "retry_units": device.retry_units,
+    })
+    profile.stop(accounting_token)
+    profile.finish_handoff_plan()
 
     return obj_patch, TranslationReport(
         failures=device.translation_failures,
@@ -1077,6 +1108,7 @@ def translate_patch(
         ),
         routing_traces=getattr(device.translator, "routing_traces", ()),
         translation_seconds=float(metrics.get("translation_seconds", 0.0)),
+        translation_wall_seconds=device.translation_wall_seconds,
         used_output_font_names=tuple(sorted(device.used_output_font_names)),
     )
 
@@ -1101,6 +1133,8 @@ def translate_stream(
     **kwarg: Any,
 ):
     started = time.perf_counter()
+    profile = profile_from_env(envs)
+    prepare_token = profile.start("prepare_seconds")
     source_size = len(stream)
     font_path = download_remote_fonts(lang_out.lower())
     style_paths = output_style_font_paths(lang_out.lower(), font_path)
@@ -1127,6 +1161,7 @@ def translate_stream(
     if not create_dual:
         doc_en.close()
     page_count = doc_zh.page_count
+    profile.set_workload({"source_pages": page_count})
     install_page_identities(doc_zh, envs)
     # Base-14 fonts must exist while pdfminer builds its font map. Unicode
     # output faces can wait until the converter tells us which styles it used.
@@ -1136,8 +1171,25 @@ def translate_stream(
 
     doc_zh.save(fp)
     prepared = time.perf_counter()
+    profile.stop(prepare_token)
+    layout_token = profile.start("layout_seconds")
     obj_patch, report = translate_patch(fp, **locals())
     patched = time.perf_counter()
+    profile.stop(layout_token)
+    if profile.plan_only:
+        doc_zh.close()
+        if create_dual:
+            doc_en.close()
+        finished = time.perf_counter()
+        snapshot = profile.snapshot(total_seconds=finished - started,
+                                    translation_seconds=report.translation_seconds)
+        report = replace(report, prepare_seconds=prepared - started,
+                         layout_seconds=snapshot["timings"]["layout_seconds"],
+                         total_seconds=finished - started, input_bytes=source_size,
+                         performance_profile=snapshot)
+        return None, None, report
+
+    render_token = profile.start("render_seconds")
 
     used_output_fonts = [
         font for font in output_font_list if font[0] in report.used_output_font_names
@@ -1174,16 +1226,25 @@ def translate_stream(
         else None
     )
     finished = time.perf_counter()
+    profile.stop(render_token)
+    snapshot = profile.snapshot(total_seconds=finished - started,
+                                translation_seconds=report.translation_seconds)
+    snapshot["layout_timer_scope"] = (
+        "exclusive layout/model/fitting stages" if profile.enabled
+        else "local patch pipeline aggregate; use --profile-performance for stage breakdown"
+    )
     report = replace(
         report,
         prepare_seconds=prepared - started,
-        layout_seconds=max(0.0, patched - prepared - report.translation_seconds),
+        layout_seconds=(snapshot["timings"]["layout_seconds"] if profile.enabled
+                        else max(0.0, patched - prepared - report.translation_wall_seconds)),
         render_seconds=finished - patched,
         total_seconds=finished - started,
         input_bytes=source_size,
         output_bytes=len(mono),
         output_font_references=font_references,
         unique_output_font_objects=unique_font_objects,
+        performance_profile=snapshot,
     )
     return (
         mono,
@@ -1321,6 +1382,9 @@ def translate(
                 create_dual=False,
                 **locals(),
             )
+            if profile_from_env(envs).plan_only:
+                result_files.append(("", report))
+                continue
             if report.failures:
                 logger.warning(
                     "%d of the segments in %s could not be translated and were left "
