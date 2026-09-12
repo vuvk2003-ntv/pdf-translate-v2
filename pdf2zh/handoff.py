@@ -115,6 +115,42 @@ def validate_no_duplicate_target_fragment(source: str, target: str) -> None:
 class HandoffAssessment:
     accepted: tuple[dict[str, Any], ...]
     retry: tuple[dict[str, Any], ...]
+
+
+def _identity_metadata(
+    record: Mapping[str, Any], identifier: str
+) -> dict[str, Any]:
+    """Validate and copy trusted Patch C identity/provenance metadata."""
+    metadata: dict[str, Any] = {}
+    if "logical_unit_id" in record:
+        logical_unit_id = record["logical_unit_id"]
+        if not isinstance(logical_unit_id, str) or not logical_unit_id:
+            raise ValueError("logical_unit_id must be a non-empty string")
+        if logical_unit_id != identifier:
+            raise ValueError("logical_unit_id must match segment_id")
+        metadata["logical_unit_id"] = logical_unit_id
+    if "occurrence_id" in record:
+        occurrence_id = record["occurrence_id"]
+        if not isinstance(occurrence_id, str) or not occurrence_id:
+            raise ValueError("occurrence_id must be a non-empty string")
+        metadata["occurrence_id"] = occurrence_id
+    if "source_fragment_ids" in record:
+        source_fragment_ids = record["source_fragment_ids"]
+        if (
+            not isinstance(source_fragment_ids, (list, tuple))
+            or not source_fragment_ids
+            or not all(
+                isinstance(fragment_id, str) and fragment_id
+                for fragment_id in source_fragment_ids
+            )
+        ):
+            raise ValueError(
+                "source_fragment_ids must be a non-empty list of non-empty strings"
+            )
+        metadata["source_fragment_ids"] = list(source_fragment_ids)
+    return metadata
+
+
 def _jsonl_records(path: Path) -> Iterable[dict[str, Any]]:
     with path.open(encoding="utf-8") as stream:
         for number, line in enumerate(stream, 1):
@@ -148,7 +184,7 @@ def _context_from_record(record: Mapping[str, Any], source: str) -> dict[str, st
 def load_source_segments(path: Path) -> list[dict[str, Any]]:
     """Load and safely deduplicate extraction records by stable identity."""
     records: list[dict[str, Any]] = []
-    seen: dict[str, str] = {}
+    seen: dict[str, tuple[str, dict[str, Any]]] = {}
     for record in _jsonl_records(path):
         source = record.get("src")
         if not isinstance(source, str) or not source:
@@ -156,13 +192,18 @@ def load_source_segments(path: Path) -> list[dict[str, Any]]:
         identifier = record.get("segment_id") or segment_identifier(source)
         if not isinstance(identifier, str):
             raise ValueError(f"{path}: segment_id must be a string")
+        identity_metadata = _identity_metadata(record, identifier)
         previous = seen.get(identifier)
         if previous is not None:
-            if previous != source:
-                raise ValueError(f"{path}: segment_id {identifier} maps to different sources")
+            if previous != (source, identity_metadata):
+                raise ValueError(
+                    f"{path}: segment_id {identifier} maps to conflicting source "
+                    "or identity metadata"
+                )
             continue
-        seen[identifier] = source
+        seen[identifier] = (source, identity_metadata)
         item: dict[str, Any] = {"segment_id": identifier, "src": source}
+        item.update(identity_metadata)
         context = _context_from_record(record, source)
         if context is not None:
             item["context"] = context
@@ -177,7 +218,7 @@ def build_handoff_batches(
     max_segments: int = 30,
     max_characters: int = 12_000,
     attempt: int = 1,
-    oversized: list[dict[str, str]] | None = None,
+    oversized: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Group independent records without repeating context for every segment."""
     if max_segments < 1 or max_characters < 1:
@@ -212,19 +253,29 @@ def build_handoff_batches(
 
     for record in segments:
         source = record["src"]
+        identifier = record["segment_id"]
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError("segment_id must be a non-empty string")
+        identity_metadata = _identity_metadata(record, identifier)
         if len(source) > max_characters:
             if oversized is None:
                 raise OversizedSegmentError(
                     f"segment {record['segment_id']} has {len(source)} characters; limit={max_characters}"
                 )
-            oversized.append({"segment_id": record["segment_id"], "src": source,
-                              "retry_reason": "OversizedSegmentError"})
+            oversized_record = {
+                "segment_id": identifier,
+                "src": source,
+                "retry_reason": "OversizedSegmentError",
+            }
+            oversized_record.update(identity_metadata)
+            oversized.append(oversized_record)
             continue
         item = {
             "type": "untrusted_source_content",
-            "segment_id": record["segment_id"],
+            "segment_id": identifier,
             "src": source,
         }
+        item.update(identity_metadata)
         context = _context_from_record(record, source)
         context_characters = len(context["text"]) if context is not None else 0
         if context is not None and len(source) + context_characters <= max_characters:
@@ -290,6 +341,7 @@ def assess_handoff_translations(
     retry: list[dict[str, Any]] = []
     for record in source_list:
         identifier, source = record["segment_id"], record["src"]
+        identity_metadata = _identity_metadata(record, identifier)
         candidate = supplied.get(identifier)
         if candidate is None or not candidate["dst"]:
             retry_record: dict[str, Any] = {
@@ -299,6 +351,7 @@ def assess_handoff_translations(
             }
             if record.get("context") is not None:
                 retry_record["context"] = record["context"]
+            retry_record.update(identity_metadata)
             retry.append(retry_record)
             continue
         try:
@@ -320,11 +373,16 @@ def assess_handoff_translations(
             }
             if record.get("context") is not None:
                 retry_record["context"] = record["context"]
+            retry_record.update(identity_metadata)
             retry.append(retry_record)
             continue
-        accepted.append(
-            {"segment_id": identifier, "src": source, "dst": candidate["dst"]}
-        )
+        accepted_record = {
+            "segment_id": identifier,
+            "src": source,
+            "dst": candidate["dst"],
+        }
+        accepted_record.update(identity_metadata)
+        accepted.append(accepted_record)
     return HandoffAssessment(tuple(accepted), tuple(retry))
 
 

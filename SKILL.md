@@ -32,8 +32,11 @@ Use the interpreter inside `<skill-root>/.venv`:
 | --- | --- | --- |
 | Google (default) | `translate.google.com` | Books, batches, first drafts, or low token use |
 | Handoff | The active agent/provider | PLC/robot terminology, context, or semantic safety needs closer control |
+| Auto | Google plus the existing Handoff JSONL workflow | Hybrid routing by logical-unit complexity |
 
 Default to Google. Offer handoff when the user asks for higher quality, rejects the Google result, or provides a short technical document.
+Use `--engine auto` only when hybrid routing is requested. It does not change
+the default or the meaning of explicit Google and Handoff modes.
 
 ## Boundaries
 
@@ -111,6 +114,43 @@ macOS/Linux:
 
 For a batch, process files individually and report progress. A failure on one file must not stop the remaining files; collect and report all failures at the end.
 
+## Auto mode
+
+AUTO routes completed Patch A logical units in a fixed order: an occurrence
+fully covered by the existing approved preservation policy is `PRESERVE`; a
+unit with deterministic combined context risk is `HANDOFF`; every other
+translatable unit is `GOOGLE`. The local router performs no LLM call, weighted
+scoring, duplicate reconstruction, or document-wide fallback.
+
+High-risk evidence is limited to combined mixed-script/protected-literal
+context, a non-trivial structural merge already reported by Patch A,
+context-sensitive callouts, multiple object/value associations, or semantic
+dependency markers combined with another complexity signal. Language, table
+membership, confidentiality, one technical token, or one UI literal alone do
+not force Handoff. A trivial wrapped paragraph can remain on Google.
+
+Routing occurs before provider cache lookup. A Handoff route never consults a
+Google cache. A Google route uses a current valid Google cache first, then a
+current valid Handoff table/cache result for the same identity, then Google.
+If a Google cache or fresh result fails Patch B, only that logical unit enters
+Handoff. Providers are never called in parallel for comparison.
+
+This repository uses Handoff MODEL_A. Direct high-risk units and Google
+failures are appended to the existing JSONL queue with `logical_unit_id`,
+`occurrence_id`, and `source_fragment_ids`. Until a valid later Handoff table
+pass resolves them, they remain `UNRESOLVED / PENDING_HANDOFF` and never count
+as translated. If no queue or valid table/cache result exists, report
+`PROVIDER_UNAVAILABLE`.
+
+```text
+<python> <skill-root>/scripts/translate_pdf.py <input.pdf> --engine auto --output-dir <output-dir> --emit-segments <pending-handoff.jsonl>
+```
+
+Reuse completed Handoff results on a later AUTO pass with
+`--segments <accepted.jsonl>`. Both provider caches retain their own provider,
+language, model, terminology, and validator namespaces. Debug mode reports the
+selected route, actual provider, reason, and flags for each logical identity.
+
 ## Handoff mode
 
 Handoff extracts translatable segments to JSONL, lets the active agent translate them, then rebuilds the PDF. Warn about token and time cost before starting a large document. For long documents, suggest a representative sample such as `--pages 1-5` first.
@@ -138,6 +178,27 @@ the native renderer. Each merged unit retains its child fragment IDs, page,
 region/cell ownership, source geometry, and a debug merge reason. Retry and
 source fallback operate on that whole unit; the existing batcher may still put
 many independent units in one request.
+
+Translation integrity is enforced after logical-unit reconstruction and before
+an occurrence can be reported as complete. Inventory every non-empty
+extractable source occurrence before translation filtering, assign each source
+span exactly once, and terminate each occurrence as exactly one of
+`TRANSLATED`, `ALLOWED_PRESERVE`, or `UNRESOLVED`. A preserve is allowed only
+when its reason comes from the existing technical, literal, reviewed-name,
+immutable-metadata, UI, terminology, or explicit-preserve policy. Source
+fallback is always `UNRESOLVED`; equality between source and target never
+creates an implicit preserve.
+
+For Vietnamese output, every fresh or cached result passes the same local Patch
+B guards. Reject unexpected Hangul for Korean input, unexpected Han for Chinese
+input, unchanged natural-language prose that required translation, damaged
+technical/literal invariants, abnormal repeated short-token or punctuation
+runs, target text longer than three times a non-trivial source, and newly
+introduced unrelated scripts. Remove only occurrence-specific approved spans
+before leakage checks. Retry the same logical unit through the existing retry
+policy; Patch B validators themselves do not select a provider. The cache namespace includes the
+translation-rules revision, and a cache hit that fails validation is treated as
+a miss.
 
 ### 1. Extract
 
@@ -260,6 +321,25 @@ the selected pages are translated.
 3. Extract text page by page and check for substantial untranslated passages, missing formulas, damaged URLs, or lost identifiers.
 4. When rendering or image inspection is available, inspect representative pages and affected code/table/formula regions for blank pages, missing glyphs, clipping, overlap, and displacement. Broaden visual review when defects appear or layout/font behavior changed; routine translation does not require a full visual pass.
 5. If full visual inspection is unavailable, say which checks were completed. Do not present a partially verified or partially translated file as fully complete.
+
+Also require Patch B coverage reconciliation:
+
+```text
+eligible_source_spans == ledger_assigned_source_spans
+unassigned_source_spans == 0
+duplicate_source_span_assignments == 0
+source_occurrences == translated_occurrences
+                    + allowed_preserve_occurrences
+                    + unresolved_occurrences
+unknown_occurrences == 0
+accounting_coverage == 1.0
+```
+
+`SUCCESS` requires zero unresolved occurrences and zero integrity failures.
+Valid accounting with safe source fallback is `PARTIAL`. Broken accounting or
+unexpected source-script glyphs reintroduced in the final extractable text
+layer is `FAIL` and must stop publication. The final script audit extracts the
+text layer only; it performs no OCR and no additional render cycle.
 
 There is no OCR. Text inside scans, screenshots, figures, schematics, or scanned
 tables may be invisible to extraction, so never claim that all visible PDF text

@@ -45,6 +45,36 @@ arbitrary production PDFs. Cross-page continuations intentionally remain two
 accounted units and must be reported as `KNOWN CROSS-PAGE CONTINUATION
 LIMITATION`.
 
+For Patch B translation-integrity changes, run
+`tests/test_patch_b_integrity.py` and retain the Patch A logical-unit fixtures.
+
+For Patch C provider-routing changes, run `tests/test_patch_c_routing.py` and
+`tests/test_handoff_workflow.py` together with Patch A, Patch B, Handoff/cache,
+terminology, proper-name, and preservation tests. These are provider-free
+string/ledger fixtures. Confirm
+that explicit Google/Handoff modes retain their meaning, AUTO routes before
+cache lookup, invalid Google results enqueue only the same identity, and
+MODEL_A pending units remain unresolved. Require `logical_unit_id`,
+`occurrence_id`, and `source_fragment_ids` to survive source loading, batching,
+accepted/retry output, and retry batching unchanged.
+The synthetic suite must cover approved and unapproved preservation, Korean and
+Chinese source-script leakage, unchanged English prose, exact technical/path
+and protocol-syntax preservation, repeated-token/character corruption, length
+explosion, unrelated Unicode scripts, exact-once source-span assignment, source
+fallback status, invalid cache hits, and final text-layer leakage. These checks
+are deterministic and provider-free.
+
+For a production run, require the Patch B report counters to reconcile exactly:
+eligible spans equal uniquely ledger-assigned spans; unassigned, duplicate, and
+unknown counts are zero; and all occurrences sum across `TRANSLATED`,
+`ALLOWED_PRESERVE`, and `UNRESOLVED`. Every allowed preserve must carry an
+approved existing-policy reason. Report `accounting_coverage` separately from
+`translation_completion_rate`; unresolved fallback lowers only the latter.
+After native generation and before atomic promotion, audit the selected pages'
+extractable text layer for Hangul/Han beyond approved preserve and explicit
+unresolved-fallback provenance. Do not add OCR, another renderer pass, provider
+routing, or semantic review for Patch B.
+
 ## PDF Gate
 
 Keep source and output hashes/paths separate. For every delivered PDF:

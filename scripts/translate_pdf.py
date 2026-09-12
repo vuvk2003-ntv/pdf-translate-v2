@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
@@ -44,7 +45,7 @@ TARGET_LANGUAGES = frozenset(
     }
 )
 
-ENGINES = ("google", "handoff")
+ENGINES = ("google", "handoff", "auto")
 EXECUTION_BACKEND = "bundled_pdf2zh"
 PAGE_ID_KEY = "PDFTranslatePageID"
 PAGE_GEOMETRY_TOLERANCE = 0.01
@@ -71,6 +72,29 @@ class Translation(NamedTuple):
     translated_segments: int = 0
     preserved_segments: int = 0
     unresolved_segments: int = 0
+    eligible_source_spans: int = 0
+    ledger_assigned_source_spans: int = 0
+    unassigned_source_spans: int = 0
+    duplicate_source_span_assignments: int = 0
+    source_occurrences: int = 0
+    translated_occurrences: int = 0
+    allowed_preserve_occurrences: int = 0
+    unresolved_occurrences: int = 0
+    unknown_occurrences: int = 0
+    unapproved_preserve_failures: int = 0
+    hangul_leak_failures: int = 0
+    han_leak_failures: int = 0
+    technical_invariant_failures: int = 0
+    unchanged_prose_failures: int = 0
+    repeated_token_corruption_failures: int = 0
+    repeated_char_corruption_failures: int = 0
+    length_explosion_failures: int = 0
+    unexpected_script_failures: int = 0
+    cache_validation_failures: int = 0
+    final_output_script_leaks: int = 0
+    accounting_coverage: float = 1.0
+    translation_completion_rate: float = 1.0
+    delivery_status: str = "SUCCESS"
     confidentiality_markers: tuple[str, ...] = ()
     unique_translation_units: int = 0
     raw_text_spans: int = 0
@@ -99,6 +123,29 @@ class Translation(NamedTuple):
     retry_units: int = 0
     handoff_table_hits: int = 0
     handoff_misses: int = 0
+    auto_units: int = 0
+    preserve_routed_units: int = 0
+    google_routed_units: int = 0
+    handoff_direct_units: int = 0
+    google_validation_failures: int = 0
+    google_to_handoff_escalations: int = 0
+    google_to_handoff_escalated_this_run: int = 0
+    pending_handoff_queue_after_run: int = 0
+    handoff_validation_failures: int = 0
+    handoff_unresolved_units: int = 0
+    google_cache_hits: int = 0
+    handoff_cache_hits: int = 0
+    google_provider_requests: int = 0
+    handoff_provider_batches_or_requests: int = 0
+    google_provider_unavailable_units: int = 0
+    handoff_provider_unavailable_units: int = 0
+    google_translation_seconds: float = 0.0
+    handoff_translation_seconds: float = 0.0
+    routing_seconds: float = 0.0
+    google_route_ratio: float = 0.0
+    handoff_direct_ratio: float = 0.0
+    escalation_ratio: float = 0.0
+    routing_traces: tuple[dict[str, object], ...] = ()
     translation_seconds: float = 0.0
     prepare_seconds: float = 0.0
     layout_seconds: float = 0.0
@@ -268,12 +315,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--segments",
         type=Path,
-        help='handoff engine: JSONL of {"src","dst"} records to translate from',
+        help='handoff/auto: JSONL of {"src","dst"} records to reuse',
     )
     parser.add_argument(
         "--emit-segments",
         type=Path,
-        help="handoff engine: write the segments left untranslated here, as JSONL",
+        help="handoff/auto: write pending Handoff units here as JSONL",
     )
     parser.add_argument("--ignore-cache", action="store_true")
     parser.add_argument("--terminology", type=Path, help="confirmed terminology JSON; scopes cache validity")
@@ -287,8 +334,12 @@ def _validate_arguments(args: argparse.Namespace) -> None:
     if args.engine == "handoff":
         if args.segments is None and args.emit_segments is None:
             raise TranslationError("--engine handoff needs --segments, --emit-segments, or both")
-    elif args.segments is not None or args.emit_segments is not None:
-        raise TranslationError("--segments and --emit-segments require --engine handoff")
+    elif args.engine == "google" and (
+        args.segments is not None or args.emit_segments is not None
+    ):
+        raise TranslationError(
+            "--segments and --emit-segments require --engine handoff or auto"
+        )
 
 
 def _require_core() -> CoreIdentity:
@@ -373,6 +424,51 @@ def _require_source_unchanged(source: Path, expected_sha256: str) -> None:
         raise TranslationError(
             f"Source PDF changed while the native engine was running: {source}"
         )
+
+
+def _audit_final_output_text_layer(
+    path: Path,
+    report: TranslationReport,
+    selected_pages: list[int] | None,
+    source_language: str,
+    target_language: str,
+) -> TranslationReport:
+    """Run the local Patch B text-layer audit without rendering or OCR."""
+    try:
+        import pymupdf
+
+        from pdf2zh.integrity import audit_final_text_layer
+
+        with pymupdf.open(path) as document:
+            page_numbers = (
+                range(document.page_count) if selected_pages is None else selected_pages
+            )
+            page_texts = {
+                page_number: document[page_number].get_text("text")
+                for page_number in page_numbers
+            }
+        audit = audit_final_text_layer(
+            page_texts,
+            report.occurrences,
+            source_language=source_language,
+            target_language=target_language,
+        )
+    except Exception as error:
+        raise TranslationError(
+            f"Patch B final text-layer audit failed: {_describe(error)}"
+        ) from error
+    if audit.final_output_script_leaks:
+        pages = ", ".join(str(page + 1) for page in audit.pages_with_leaks)
+        raise TranslationError(
+            "Patch B rejected the generated PDF: "
+            f"final_output_script_leaks={audit.final_output_script_leaks} "
+            f"on page(s) {pages}"
+        )
+    return replace(
+        report,
+        final_output_script_leaks=0,
+        delivery_status=("PARTIAL" if report.unresolved_occurrences else "SUCCESS"),
+    )
 
 
 def _page_identity(source_sha256: str, page_index: int) -> str:
@@ -580,7 +676,7 @@ def _run_engine(
     engine: str,
     envs: dict[str, object],
     on_progress: Callable[[int, int], None] | None = None,
-) -> "TranslationReport":
+) -> TranslationReport:
     """Run the core and return what it could not translate, and why."""
     from pdf2zh.high_level import translate
 
@@ -719,14 +815,14 @@ def translate_pdf(
         # translation is the one outcome the preservation rules forbid outright:
         # say what the document actually needs instead. The message carries the
         # words app/errors.py matches for E-PDF-03.
-        if report.translatable_segments == 0:
+        if report.eligible_source_spans == 0 and report.translatable_segments == 0:
             raise TranslationError(
                 f"No text could be extracted from {source.name}: the selected pages are "
                 "image-only scans. This tool does not perform OCR, so run OCR on the "
                 "PDF first and translate the result."
             )
 
-        untranslated = len(report.failures)
+        untranslated = report.unresolved_occurrences
         image_only = tuple(sorted(report.image_only_pages))
         if destination is None:
             return Translation(
@@ -738,6 +834,33 @@ def translate_pdf(
                 translated_segments=report.translated_segments,
                 preserved_segments=report.preserved_segments,
                 unresolved_segments=report.unresolved_segments,
+                eligible_source_spans=report.eligible_source_spans,
+                ledger_assigned_source_spans=report.ledger_assigned_source_spans,
+                unassigned_source_spans=report.unassigned_source_spans,
+                duplicate_source_span_assignments=report.duplicate_source_span_assignments,
+                source_occurrences=report.source_occurrences,
+                translated_occurrences=report.translated_occurrences,
+                allowed_preserve_occurrences=report.allowed_preserve_occurrences,
+                unresolved_occurrences=report.unresolved_occurrences,
+                unknown_occurrences=report.unknown_occurrences,
+                unapproved_preserve_failures=report.unapproved_preserve_failures,
+                hangul_leak_failures=report.hangul_leak_failures,
+                han_leak_failures=report.han_leak_failures,
+                technical_invariant_failures=report.technical_invariant_failures,
+                unchanged_prose_failures=report.unchanged_prose_failures,
+                repeated_token_corruption_failures=(
+                    report.repeated_token_corruption_failures
+                ),
+                repeated_char_corruption_failures=(
+                    report.repeated_char_corruption_failures
+                ),
+                length_explosion_failures=report.length_explosion_failures,
+                unexpected_script_failures=report.unexpected_script_failures,
+                cache_validation_failures=report.cache_validation_failures,
+                final_output_script_leaks=report.final_output_script_leaks,
+                accounting_coverage=report.accounting_coverage,
+                translation_completion_rate=report.translation_completion_rate,
+                delivery_status=report.delivery_status,
                 confidentiality_markers=confidentiality_markers,
                 unique_translation_units=report.unique_translation_units,
                 raw_text_spans=report.raw_text_spans,
@@ -766,6 +889,39 @@ def translate_pdf(
                 retry_units=report.retry_units,
                 handoff_table_hits=report.handoff_table_hits,
                 handoff_misses=report.handoff_misses,
+                auto_units=report.auto_units,
+                preserve_routed_units=report.preserve_routed_units,
+                google_routed_units=report.google_routed_units,
+                handoff_direct_units=report.handoff_direct_units,
+                google_validation_failures=report.google_validation_failures,
+                google_to_handoff_escalations=report.google_to_handoff_escalations,
+                google_to_handoff_escalated_this_run=(
+                    report.google_to_handoff_escalated_this_run
+                ),
+                pending_handoff_queue_after_run=(
+                    report.pending_handoff_queue_after_run
+                ),
+                handoff_validation_failures=report.handoff_validation_failures,
+                handoff_unresolved_units=report.handoff_unresolved_units,
+                google_cache_hits=report.google_cache_hits,
+                handoff_cache_hits=report.handoff_cache_hits,
+                google_provider_requests=report.google_provider_requests,
+                handoff_provider_batches_or_requests=(
+                    report.handoff_provider_batches_or_requests
+                ),
+                google_provider_unavailable_units=(
+                    report.google_provider_unavailable_units
+                ),
+                handoff_provider_unavailable_units=(
+                    report.handoff_provider_unavailable_units
+                ),
+                google_translation_seconds=report.google_translation_seconds,
+                handoff_translation_seconds=report.handoff_translation_seconds,
+                routing_seconds=report.routing_seconds,
+                google_route_ratio=report.google_route_ratio,
+                handoff_direct_ratio=report.handoff_direct_ratio,
+                escalation_ratio=report.escalation_ratio,
+                routing_traces=report.routing_traces,
                 translation_seconds=report.translation_seconds,
                 prepare_seconds=report.prepare_seconds,
                 layout_seconds=report.layout_seconds,
@@ -796,6 +952,13 @@ def translate_pdf(
 
         candidate_facts = _pdf_facts(generated, role="generated candidate")
         _validate_candidate(source_facts, candidate_facts, expected_page_ids)
+        report = _audit_final_output_text_layer(
+            generated,
+            report,
+            selected_pages,
+            source_language,
+            target_language,
+        )
 
         # The structural gates above are fatal. Layout warnings remain diagnostic,
         # but the validator itself must complete before an artifact can be final.
@@ -858,6 +1021,29 @@ def translate_pdf(
         translated_segments=report.translated_segments,
         preserved_segments=report.preserved_segments,
         unresolved_segments=report.unresolved_segments,
+        eligible_source_spans=report.eligible_source_spans,
+        ledger_assigned_source_spans=report.ledger_assigned_source_spans,
+        unassigned_source_spans=report.unassigned_source_spans,
+        duplicate_source_span_assignments=report.duplicate_source_span_assignments,
+        source_occurrences=report.source_occurrences,
+        translated_occurrences=report.translated_occurrences,
+        allowed_preserve_occurrences=report.allowed_preserve_occurrences,
+        unresolved_occurrences=report.unresolved_occurrences,
+        unknown_occurrences=report.unknown_occurrences,
+        unapproved_preserve_failures=report.unapproved_preserve_failures,
+        hangul_leak_failures=report.hangul_leak_failures,
+        han_leak_failures=report.han_leak_failures,
+        technical_invariant_failures=report.technical_invariant_failures,
+        unchanged_prose_failures=report.unchanged_prose_failures,
+        repeated_token_corruption_failures=report.repeated_token_corruption_failures,
+        repeated_char_corruption_failures=report.repeated_char_corruption_failures,
+        length_explosion_failures=report.length_explosion_failures,
+        unexpected_script_failures=report.unexpected_script_failures,
+        cache_validation_failures=report.cache_validation_failures,
+        final_output_script_leaks=report.final_output_script_leaks,
+        accounting_coverage=report.accounting_coverage,
+        translation_completion_rate=report.translation_completion_rate,
+        delivery_status=report.delivery_status,
         confidentiality_markers=confidentiality_markers,
         unique_translation_units=report.unique_translation_units,
         raw_text_spans=report.raw_text_spans,
@@ -886,6 +1072,33 @@ def translate_pdf(
         retry_units=report.retry_units,
         handoff_table_hits=report.handoff_table_hits,
         handoff_misses=report.handoff_misses,
+        auto_units=report.auto_units,
+        preserve_routed_units=report.preserve_routed_units,
+        google_routed_units=report.google_routed_units,
+        handoff_direct_units=report.handoff_direct_units,
+        google_validation_failures=report.google_validation_failures,
+        google_to_handoff_escalations=report.google_to_handoff_escalations,
+        google_to_handoff_escalated_this_run=(
+            report.google_to_handoff_escalated_this_run
+        ),
+        pending_handoff_queue_after_run=report.pending_handoff_queue_after_run,
+        handoff_validation_failures=report.handoff_validation_failures,
+        handoff_unresolved_units=report.handoff_unresolved_units,
+        google_cache_hits=report.google_cache_hits,
+        handoff_cache_hits=report.handoff_cache_hits,
+        google_provider_requests=report.google_provider_requests,
+        handoff_provider_batches_or_requests=(
+            report.handoff_provider_batches_or_requests
+        ),
+        google_provider_unavailable_units=report.google_provider_unavailable_units,
+        handoff_provider_unavailable_units=report.handoff_provider_unavailable_units,
+        google_translation_seconds=report.google_translation_seconds,
+        handoff_translation_seconds=report.handoff_translation_seconds,
+        routing_seconds=report.routing_seconds,
+        google_route_ratio=report.google_route_ratio,
+        handoff_direct_ratio=report.handoff_direct_ratio,
+        escalation_ratio=report.escalation_ratio,
+        routing_traces=report.routing_traces,
         translation_seconds=report.translation_seconds,
         prepare_seconds=report.prepare_seconds,
         layout_seconds=report.layout_seconds,
@@ -949,7 +1162,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
     if result.path is not None:
-        print(f"Translated PDF: {result.path}")
+        label = "Translated PDF" if result.delivery_status == "SUCCESS" else "Partial PDF"
+        print(f"{label}: {result.path}")
         print(
             "Artifact provenance: "
             + json.dumps(
@@ -969,6 +1183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "source_language": result.source_language,
                     "target_language": result.target_language,
                     "native_validator_status": result.native_validator_status,
+                    "delivery_status": result.delivery_status,
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -995,6 +1210,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"unresolved={result.unresolved_segments}"
         )
         print(
+            "Patch B coverage: "
+            f"eligible_source_spans={result.eligible_source_spans}, "
+            f"ledger_assigned_source_spans={result.ledger_assigned_source_spans}, "
+            f"unassigned_source_spans={result.unassigned_source_spans}, "
+            "duplicate_source_span_assignments="
+            f"{result.duplicate_source_span_assignments}"
+        )
+        print(
+            "Patch B occurrences: "
+            f"source_occurrences={result.source_occurrences}, "
+            f"translated_occurrences={result.translated_occurrences}, "
+            f"allowed_preserve_occurrences={result.allowed_preserve_occurrences}, "
+            f"unresolved_occurrences={result.unresolved_occurrences}, "
+            f"unknown_occurrences={result.unknown_occurrences}, "
+            f"accounting_coverage={result.accounting_coverage:.4f}, "
+            "translation_completion_rate="
+            f"{result.translation_completion_rate:.4f}, "
+            f"delivery_status={result.delivery_status}"
+        )
+        print(
+            "Patch B integrity failures: "
+            f"unapproved_preserve_failures={result.unapproved_preserve_failures}, "
+            f"hangul_leak_failures={result.hangul_leak_failures}, "
+            f"han_leak_failures={result.han_leak_failures}, "
+            f"technical_invariant_failures={result.technical_invariant_failures}, "
+            f"unchanged_prose_failures={result.unchanged_prose_failures}, "
+            "repeated_token_corruption_failures="
+            f"{result.repeated_token_corruption_failures}, "
+            "repeated_char_corruption_failures="
+            f"{result.repeated_char_corruption_failures}, "
+            f"length_explosion_failures={result.length_explosion_failures}, "
+            f"unexpected_script_failures={result.unexpected_script_failures}, "
+            f"cache_validation_failures={result.cache_validation_failures}, "
+            f"final_output_script_leaks={result.final_output_script_leaks}"
+        )
+        print(
             "Translation work: "
             f"unique_units={result.unique_translation_units}, "
             f"provider_requests={result.provider_requests}, "
@@ -1003,6 +1254,48 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"handoff_table_hits={result.handoff_table_hits}, "
             f"handoff_misses={result.handoff_misses}"
         )
+        print(
+            "AUTO routing: "
+            f"auto_units={result.auto_units}, "
+            f"preserve_routed_units={result.preserve_routed_units}, "
+            f"google_routed_units={result.google_routed_units}, "
+            f"handoff_direct_units={result.handoff_direct_units}, "
+            f"google_validation_failures={result.google_validation_failures}, "
+            f"google_to_handoff_escalations={result.google_to_handoff_escalations}, "
+            "google_to_handoff_escalated_this_run="
+            f"{result.google_to_handoff_escalated_this_run}, "
+            "pending_handoff_queue_after_run="
+            f"{result.pending_handoff_queue_after_run}, "
+            f"handoff_validation_failures={result.handoff_validation_failures}, "
+            f"handoff_unresolved_units={result.handoff_unresolved_units}"
+        )
+        print(
+            "AUTO provider/cache: "
+            f"google_cache_hits={result.google_cache_hits}, "
+            f"handoff_cache_hits={result.handoff_cache_hits}, "
+            f"google_provider_requests={result.google_provider_requests}, "
+            "handoff_provider_batches_or_requests="
+            f"{result.handoff_provider_batches_or_requests}, "
+            "google_provider_unavailable_units="
+            f"{result.google_provider_unavailable_units}, "
+            "handoff_provider_unavailable_units="
+            f"{result.handoff_provider_unavailable_units}"
+        )
+        print(
+            "AUTO timing/ratios: "
+            f"google_translation_seconds={result.google_translation_seconds:.3f}, "
+            f"handoff_translation_seconds={result.handoff_translation_seconds:.3f}, "
+            f"routing_seconds={result.routing_seconds:.6f}, "
+            f"google_route_ratio={result.google_route_ratio:.4f}, "
+            f"handoff_direct_ratio={result.handoff_direct_ratio:.4f}, "
+            f"escalation_ratio={result.escalation_ratio:.4f}"
+        )
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            for trace in result.routing_traces:
+                print(
+                    "AUTO route trace: "
+                    + json.dumps(trace, ensure_ascii=False, separators=(",", ":"))
+                )
         print(
             "Logical reconstruction: "
             f"raw_text_spans={result.raw_text_spans}, "
@@ -1077,6 +1370,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         emitted = args.emit_segments.expanduser().resolve()
         pending = sum(1 for line in emitted.open(encoding="utf-8") if line.strip())
         print(f"Segments left untranslated: {pending} -> {emitted}")
+    if result.path is not None and result.delivery_status == "PARTIAL":
+        return 3
     return 0
 
 

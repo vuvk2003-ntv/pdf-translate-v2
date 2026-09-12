@@ -72,6 +72,94 @@ class HandoffWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(len(load_source_segments(path)), 2)
 
+    def test_patch_c_identity_metadata_survives_batch_acceptance_and_retry(self):
+        extraction_records = [
+            {
+                "segment_id": "unit-accepted",
+                "logical_unit_id": "unit-accepted",
+                "occurrence_id": "occurrence-accepted",
+                "source_fragment_ids": ["fragment-a", "fragment-b"],
+                "src": "Source sentence 1.",
+            },
+            {
+                "segment_id": "unit-retry",
+                "logical_unit_id": "unit-retry",
+                "occurrence_id": "occurrence-retry",
+                "source_fragment_ids": ["fragment-c"],
+                "src": "Source sentence 2.",
+            },
+        ]
+        source_path = write_jsonl(self.root / "identity-segments.jsonl", extraction_records)
+        sources = load_source_segments(source_path)
+        batch_records = build_handoff_batches(sources)[0]["segments"]
+        for expected, actual in zip(extraction_records, batch_records):
+            for name in ("logical_unit_id", "occurrence_id", "source_fragment_ids"):
+                self.assertEqual(actual[name], expected[name])
+
+        translations_path = write_jsonl(
+            self.root / "identity-translations.jsonl",
+            [
+                {
+                    "segment_id": "unit-accepted",
+                    "src": "Source sentence 1.",
+                    "dst": "Câu nguồn 1.",
+                }
+            ],
+        )
+        assessment = assess_handoff_translations(sources, translations_path)
+        self.assertEqual(len(assessment.accepted), 1)
+        self.assertEqual(len(assessment.retry), 1)
+        for expected, actual in zip(
+            extraction_records, (assessment.accepted[0], assessment.retry[0])
+        ):
+            for name in ("logical_unit_id", "occurrence_id", "source_fragment_ids"):
+                self.assertEqual(actual[name], expected[name])
+        retry_batch_record = build_handoff_batches(assessment.retry, attempt=2)[0][
+            "segments"
+        ][0]
+        for name in ("logical_unit_id", "occurrence_id", "source_fragment_ids"):
+            self.assertEqual(retry_batch_record[name], extraction_records[1][name])
+
+    def test_patch_c_identity_metadata_rejects_invalid_values(self):
+        invalid_records = (
+            {
+                "segment_id": "unit-1",
+                "logical_unit_id": "different-unit",
+                "src": "Source sentence.",
+            },
+            {
+                "segment_id": "unit-1",
+                "source_fragment_ids": ["fragment-1", ""],
+                "src": "Source sentence.",
+            },
+        )
+        for index, record in enumerate(invalid_records):
+            with self.subTest(index=index):
+                path = write_jsonl(self.root / f"invalid-identity-{index}.jsonl", [record])
+                with self.assertRaises(ValueError):
+                    load_source_segments(path)
+        conflicting = write_jsonl(
+            self.root / "conflicting-identity.jsonl",
+            [
+                {
+                    "segment_id": "unit-1",
+                    "logical_unit_id": "unit-1",
+                    "occurrence_id": "occurrence-1",
+                    "source_fragment_ids": ["fragment-1"],
+                    "src": "Source sentence.",
+                },
+                {
+                    "segment_id": "unit-1",
+                    "logical_unit_id": "unit-1",
+                    "occurrence_id": "occurrence-2",
+                    "source_fragment_ids": ["fragment-1"],
+                    "src": "Source sentence.",
+                },
+            ],
+        )
+        with self.assertRaises(ValueError):
+            load_source_segments(conflicting)
+
     def test_partial_retry_accepts_valid_units_and_retries_only_failures(self):
         sources = self._sources(30)
         translations = [

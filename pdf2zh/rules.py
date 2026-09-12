@@ -110,6 +110,14 @@ class TableTextCluster:
     style: int = 0
     parent_id: Any = None
     fragment_id: str | None = None
+    # Patch C reads these values from Patch A's completed result.  They are
+    # provenance only: they do not participate in grouping or merge decisions.
+    logical_unit_id: str | None = None
+    source_fragment_ids: tuple[str, ...] = ()
+    merge_reasons: tuple[str, ...] = ()
+    cell_id: Any = None
+    callout_id: Any = None
+    structural_role: str = "body"
 
 
 def is_formula_font(font_name: str) -> bool:
@@ -456,6 +464,14 @@ def group_translatable_line_clusters(
                     default=None,
                 ),
                 parent_id=children[0].parent_id if children else None,
+                logical_unit_id=unit.logical_unit_id,
+                source_fragment_ids=tuple(
+                    fragment.fragment_id for fragment in unit.fragments
+                ),
+                merge_reasons=unit.merge_reasons,
+                cell_id=cell_id,
+                callout_id=callout_id,
+                structural_role=structural_role,
             )
         )
     return result

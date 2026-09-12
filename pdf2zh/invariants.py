@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
 # Bump when classifier/validation semantics change; old cache entries stay on disk.
-TRANSLATION_RULES_VERSION = "code4life-translation-v4"
+TRANSLATION_RULES_VERSION = "code4life-translation-v5"
 
 # Reviewed, exact source aliases only. Adding or changing an entry also requires
 # a translation-rules revision so an older cache cannot bypass the new invariant.
@@ -246,6 +246,8 @@ CODE_STATEMENT_PATTERN = re.compile(
     rf"(?<!\w)(?:(?:DFROM_M|DTO_M|MOV|BMOV|SET|RST|TON|MOVJ|MOVL)"
     rf"(?:[ \t]+{CODE_OPERAND})+(?!\w)|NWAIT(?!\w))"
 )
+TECHNICAL_SYNTAX_PATTERN = re.compile(r"/\*|\*/|//|[;$*\[\]{}]")
+INLINE_CODE_PATTERN = re.compile(r"`([^`\r\n]+)`")
 
 
 def is_executable_code_line(text: str) -> bool:
@@ -266,6 +268,20 @@ def _executable_tokens(text: str) -> list[str]:
             for match in CODE_STATEMENT_PATTERN.finditer(line):
                 tokens.extend(_regex_tokens(EXECUTABLE_CODE_TOKEN_PATTERN, match[0]))
     return tokens
+
+
+def _technical_syntax_tokens(text: str) -> list[str]:
+    """Protect syntax only inside explicit code spans or recognized code lines."""
+    tokens: list[str] = []
+    tokens.extend(
+        token
+        for match in INLINE_CODE_PATTERN.finditer(text)
+        for token in _regex_tokens(TECHNICAL_SYNTAX_PATTERN, match.group(1))
+    )
+    for line in text.splitlines():
+        if is_executable_code_line(line):
+            tokens.extend(_regex_tokens(TECHNICAL_SYNTAX_PATTERN, line))
+    return tokens
 PLACEHOLDER_PATTERN = re.compile(
     r"\{\{[^{}\r\n]+\}\}|\{[A-Za-z_][\w.-]*\}|"
     r"\$\{[A-Za-z_][\w.-]*\}|\$[A-Za-z_][\w.-]*|%(?:\d+|[sdif])"
@@ -281,6 +297,20 @@ def _regex_tokens(pattern: re.Pattern[str], text: str) -> list[str]:
 
 def _url_tokens(text: str) -> list[str]:
     return [token.rstrip(".,;:!?)") for token in _regex_tokens(URL_PATTERN, text)]
+
+
+def _windows_path_tokens(text: str) -> list[str]:
+    return [
+        token.rstrip(".,!?)”’")
+        for token in _regex_tokens(WINDOWS_PATH_PATTERN, text)
+    ]
+
+
+def _file_name_tokens(text: str) -> list[str]:
+    # A terminal full stop belongs to prose, not a Windows filename.  Work on a
+    # comparison-only copy so provider masking and the source bytes stay exact.
+    comparison = re.sub(r"(?<=[A-Za-z0-9])([.!?])(?=\s|$)", "", text)
+    return _regex_tokens(FILE_NAME_PATTERN, comparison)
 
 
 def _tag_tokens(text: str) -> list[str]:
@@ -341,9 +371,9 @@ TOKEN_CHECKS: tuple[tuple[str, Callable[[str], list[str]]], ...] = (
     ("placeholders", lambda text: _regex_tokens(PLACEHOLDER_PATTERN, text)),
     ("structural tags", _tag_tokens),
     ("URLs", _url_tokens),
-    ("Windows paths", lambda text: _regex_tokens(WINDOWS_PATH_PATTERN, text)),
+    ("Windows paths", _windows_path_tokens),
     ("POSIX paths", lambda text: _regex_tokens(POSIX_PATH_PATTERN, text)),
-    ("file names", lambda text: _regex_tokens(FILE_NAME_PATTERN, text)),
+    ("file names", _file_name_tokens),
     ("document-control labels", lambda text: _regex_tokens(DOCUMENT_LABEL_PATTERN, text)),
     ("IPv4 addresses", lambda text: _regex_tokens(IPV4_PATTERN, text)),
     ("network endpoints", lambda text: _regex_tokens(NETWORK_ENDPOINT_PATTERN, text)),
@@ -367,6 +397,7 @@ TOKEN_CHECKS: tuple[tuple[str, Callable[[str], list[str]]], ...] = (
         "executable code tokens",
         _executable_tokens,
     ),
+    ("technical syntax", _technical_syntax_tokens),
 )
 
 _NAMED_OBJECT_PATTERN = re.compile(

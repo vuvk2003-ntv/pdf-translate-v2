@@ -19,11 +19,28 @@ from pdfminer.utils import apply_matrix_pt, mult_matrix
 from pymupdf import Font
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from pdf2zh.integrity import (
+    APPROVED_PRESERVE_REASONS,
+    AllowedPreserveSpan,
+    EligibleSourceSpan,
+    IntegrityFailure,
+    Occurrence,
+    OccurrenceLedger,
+    OccurrenceStatus,
+    TranslationIntegrityError,
+    approved_spans_for_translation,
+    stable_logical_unit_id,
+    stable_occurrence_id,
+    stable_source_span_id,
+)
 from pdf2zh.invariants import (
+    TechnicalInvariantError,
+    VerifiedProperNameError,
     is_context_sensitive_korean,
     is_executable_code_line,
     is_standalone_verified_proper_name,
 )
+from pdf2zh.routing import RoutingMetadata, route_logical_unit
 from pdf2zh.rules import (
     COMMON_STANDALONE_TECHNICAL_TERM_PATTERN,
     is_bullet_character,
@@ -31,9 +48,11 @@ from pdf2zh.rules import (
     line_height_for_language,
     min_line_height_for_language,
 )
+from pdf2zh.terminology import TerminologyConsistencyError
 from pdf2zh.translator import (
     ENGINES,
     BaseTranslator,
+    FormulaPlaceholderError,
     encode_formula_placeholders,
     restore_formula_placeholders,
     segment_identifier,
@@ -496,6 +515,32 @@ def is_translatable_segment(
         and PLACEHOLDER_ONLY_PATTERN.fullmatch(visible) is None
         and needs_model_translation(segment, terminology)
     )
+
+
+def approved_preserve_reason(
+    segment: str,
+    *,
+    explicitly_preserved: bool,
+    terminology: Mapping[str, str] | None = None,
+) -> str | None:
+    """Explain an existing filter decision using only approved policy categories."""
+    if explicitly_preserved:
+        return "immutable_metadata"
+    if is_standalone_verified_proper_name(segment, terminology):
+        return "reviewed_proper_name"
+    visible = strip_style_tags(segment).strip()
+    if not visible:
+        return None
+    if PLACEHOLDER_ONLY_PATTERN.fullmatch(visible):
+        return "technical_invariant"
+    if not needs_model_translation(segment, terminology):
+        if any(
+            term and target == term and term in visible
+            for term, target in (terminology or {}).items()
+        ):
+            return "explicit_technical_term"
+        return "technical_invariant"
+    return None
 
 
 def styled_character_text(characters: list[LTChar]) -> str:
@@ -1066,6 +1111,9 @@ class TranslateConverter(PDFConverterEx):
         # entry in sstk is translated, deliberately preserved, or unresolved.
         self.extracted_segments: int = 0
         self.logical_unit_char_counts: list[int] = []
+        self.integrity_ledger = OccurrenceLedger()
+        self._failed_occurrence_ids: set[str] = set()
+        self._page_occurrence_offsets: Counter[int] = Counter()
         # Pages carrying a raster image, filled in by the caller.
         self.pages_with_images: set[int] = set()
         self.segments_by_page: Counter[int] = Counter()
@@ -1106,10 +1154,25 @@ class TranslateConverter(PDFConverterEx):
             if not self.segments_by_page[page]
         }
 
-    def record_translation_failure(self, segment: str, reason: str) -> None:
+    def record_translation_failure(
+        self,
+        segment: str,
+        reason: str,
+        *,
+        occurrence_id: str | None = None,
+        failure_codes: Iterable[str] = (),
+    ) -> None:
         with self._failure_lock:
+            if occurrence_id is not None and occurrence_id in self._failed_occurrence_ids:
+                return
+            if occurrence_id is not None:
+                self._failed_occurrence_ids.add(occurrence_id)
             self.translation_failures.append(segment)
             self.failure_reasons[reason] += 1
+        if occurrence_id is not None:
+            self.integrity_ledger.mark_unresolved(
+                occurrence_id, reason, failure_codes
+            )
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
                 "Leaving segment %s in source language (%s): %r",
@@ -1146,6 +1209,7 @@ class TranslateConverter(PDFConverterEx):
         page_class_bounds = self.class_bounds.get(ltpage.pageid, {})
         ops: str = ""
         preserved_segments: set[str] = set()
+        explicitly_preserved_indices: set[int] = set()
 
         def vflag(font: str, char: str):
             if isinstance(font, bytes):
@@ -1253,7 +1317,10 @@ class TranslateConverter(PDFConverterEx):
             )
 
         ############################################################
-        page_logical_classes = self.logical_classes.get(ltpage.pageid, set())
+        page_logical_classes = self.logical_classes.get(ltpage.pageid, {})
+        page_logical_metadata = (
+            page_logical_classes if isinstance(page_logical_classes, dict) else {}
+        )
         for child in iter_layout_items(ltpage):
             if isinstance(child, LTChar):
                 if is_outside_page(child, self.page_clip):
@@ -1454,6 +1521,7 @@ class TranslateConverter(PDFConverterEx):
             paragraph.brk = False
             if not should_translate_rotated_text(sstk[index]):
                 preserved_segments.add(sstk[index])
+                explicitly_preserved_indices.add(index)
 
         page_bounds = self.layout_bounds.get(ltpage.pageid, {})
         for paragraph in pstk:
@@ -1492,6 +1560,97 @@ class TranslateConverter(PDFConverterEx):
         ############################################################
         log.debug("\n==========[SSTACK]==========\n")
 
+        source_span_ids: list[str | None] = []
+        occurrence_ids: list[str | None] = []
+        logical_unit_ids: list[str | None] = []
+        routing_metadata: list[RoutingMetadata | None] = []
+        formula_texts_by_occurrence: list[tuple[str, ...]] = []
+        ledger_source_texts: list[str] = []
+
+        def materialize_formula_text(
+            text: str,
+            formula_ids: Sequence[int],
+            formula_texts: tuple[str, ...],
+        ) -> str:
+            by_identifier = {
+                identifier: formula_text
+                for identifier, formula_text in zip(
+                    formula_ids,
+                    formula_texts,
+                )
+            }
+            return re.sub(
+                r"\{\s*v([\d\s]+)\}",
+                lambda match: by_identifier.get(
+                    int(match.group(1).replace(" ", "")), match.group(0)
+                ),
+                text,
+                flags=re.IGNORECASE,
+            )
+
+        for index, source in enumerate(sstk):
+            formula_texts = tuple(
+                (
+                    "".join(character.get_text() for character in var[identifier])
+                    if 0 <= identifier < len(var)
+                    else ""
+                )
+                for identifier in pstk[index].formula_ids
+            )
+            formula_texts_by_occurrence.append(formula_texts)
+            ledger_source_texts.append(
+                materialize_formula_text(source, pstk[index].formula_ids, formula_texts)
+            )
+
+        page_occurrence_offset = self._page_occurrence_offsets[ltpage.pageid]
+        self._page_occurrence_offsets[ltpage.pageid] += len(sstk)
+        for index, source in enumerate(ledger_source_texts):
+            if not source.strip():
+                source_span_ids.append(None)
+                occurrence_ids.append(None)
+                logical_unit_ids.append(None)
+                routing_metadata.append(None)
+                continue
+            ordinal = page_occurrence_offset + index
+            source_span_id = stable_source_span_id(ltpage.pageid, ordinal, source)
+            occurrence_id = stable_occurrence_id(ltpage.pageid, ordinal, source)
+            patch_a = page_logical_metadata.get(pstk[index].cls, {})
+            if not isinstance(patch_a, dict):
+                patch_a = {}
+            logical_unit_id = patch_a.get("logical_unit_id") or stable_logical_unit_id(
+                ltpage.pageid, ordinal, source
+            )
+            self.integrity_ledger.add_eligible_span(
+                EligibleSourceSpan(
+                    source_span_id=source_span_id,
+                    page=ltpage.pageid,
+                    source_text=source,
+                    region_id=str(pstk[index].cls),
+                    logical_unit_id=logical_unit_id,
+                )
+            )
+            source_span_ids.append(source_span_id)
+            occurrence_ids.append(occurrence_id)
+            logical_unit_ids.append(logical_unit_id)
+            routing_metadata.append(
+                RoutingMetadata(
+                    was_fragment_reconstructed=bool(
+                        patch_a.get("was_fragment_reconstructed", False)
+                    ),
+                    reconstruction_complexity=patch_a.get("reconstruction_complexity"),
+                    is_callout=bool(patch_a.get("is_callout", False)),
+                    is_dense_table_text=(
+                        pstk[index].layout_bound is not None
+                        and len(strip_style_tags(source)) >= 120
+                    ),
+                    logical_unit_id=logical_unit_id,
+                    occurrence_id=occurrence_id,
+                    source_fragment_ids=tuple(
+                        patch_a.get("source_fragment_ids") or (source_span_id,)
+                    ),
+                )
+            )
+
         # Google throttles a long document, so back off instead of hammering it.
         # Roughly two minutes of patience per segment, then give up rather than
         # hang the run forever the way an unbounded retry used to.
@@ -1513,17 +1672,25 @@ class TranslateConverter(PDFConverterEx):
         def request_translation(
             s: str,
             identity: str,
-            context: dict[str, str] | None,
+            context: dict[str, object] | None,
         ) -> str:
             return self.translator.translate_with_identity(s, identity, context=context)
 
         def translate_segment(
             s: str,
             identity: str,
-            context: dict[str, str] | None,
+            context: dict[str, object] | None,
         ) -> tuple[str, bool]:
             preferred = preferred_translation(s, self.translator.lang_out)
             if preferred is not None:
+                self.translator.validate(s, preferred)
+                if self.translator.name == "auto" and context is not None:
+                    decision = context.get("routing_decision")
+                    metadata = context.get("routing_metadata")
+                    if decision is not None and metadata is not None:
+                        self.translator.record_local_translation(
+                            identity, decision, metadata
+                        )
                 return preferred, True
             encoded = encode_formula_placeholders(s)
             translated = request_translation(encoded, identity, context)
@@ -1532,18 +1699,23 @@ class TranslateConverter(PDFConverterEx):
                 self.translator.has_translation_for_identity(encoded, identity),
             )
 
-        def worker(job: tuple[str, str, dict[str, str] | None]) -> tuple[str, str]:
+        def worker(
+            job: tuple[str, str, dict[str, str] | None]
+        ) -> tuple[str, str, str | None, tuple[str, ...]]:
             s, identity, context = job
-            if not is_translatable_segment(
-                s, preserved_segments, self.translator.terminology
-            ):
-                return s, "preserved"
             try:
                 translated, resolved = translate_segment(s, identity, context)
                 if not resolved:
-                    self.record_translation_failure(s, "UnresolvedSegmentError")
-                    return s, "unresolved"
-                return translated, "translated"
+                    unresolved_reason = getattr(
+                        self.translator, "unresolved_reason_for_identity", None
+                    )
+                    reason = (
+                        unresolved_reason(identity)
+                        if callable(unresolved_reason)
+                        else "UnresolvedSegmentError"
+                    )
+                    return s, "unresolved", reason, ()
+                return translated, "translated", None, ()
             except BaseException as e:
                 # A book is thousands of segments over tens of minutes, so one
                 # dead connection must not throw the whole document away. Keep
@@ -1556,15 +1728,34 @@ class TranslateConverter(PDFConverterEx):
                         segment_identifier(s),
                         type(e).__name__,
                     )
-                self.record_translation_failure(s, type(e).__name__)
-                return s, "unresolved"
+                failure_codes: tuple[str, ...] = ()
+                if isinstance(e, TranslationIntegrityError):
+                    failure_codes = e.failure_codes
+                elif isinstance(
+                    e,
+                    (
+                        FormulaPlaceholderError,
+                        TechnicalInvariantError,
+                        TerminologyConsistencyError,
+                        VerifiedProperNameError,
+                    ),
+                ):
+                    failure_codes = (IntegrityFailure.TECHNICAL_INVARIANT.value,)
+                record_unresolved = getattr(
+                    self.translator, "record_unresolved_identity", None
+                )
+                if callable(record_unresolved):
+                    record_unresolved(identity, type(e).__name__)
+                return s, "unresolved", type(e).__name__, failure_codes
         # Counted here rather than inside worker: worker runs on the pool, and
         # "+= 1" from several threads drops updates.
         translatable = sum(
             1
-            for s in sstk
+            for index, source in enumerate(sstk)
             if is_translatable_segment(
-                s, preserved_segments, self.translator.terminology
+                source,
+                {source} if index in explicitly_preserved_indices else (),
+                self.translator.terminology,
             )
         )
         self.translatable_segments += translatable
@@ -1574,32 +1765,78 @@ class TranslateConverter(PDFConverterEx):
         )
         self.segments_by_page[ltpage.pageid] += translatable
 
-        outcomes: list[tuple[str, str] | None] = [None] * len(sstk)
+        outcomes: list[tuple[str, str, str | None, tuple[str, ...]] | None] = [
+            None
+        ] * len(sstk)
+        preserve_reasons: list[str | None] = [None] * len(sstk)
         jobs: dict[
             tuple[str, object],
-            tuple[str, list[int], str, dict[str, str] | None],
+            tuple[str, list[int], str, dict[str, object] | None],
         ] = {}
         for index, source in enumerate(sstk):
-            if not is_translatable_segment(
-                source, preserved_segments, self.translator.terminology
-            ):
-                outcomes[index] = (source, "preserved")
+            explicitly_preserved = index in explicitly_preserved_indices
+            is_translatable = is_translatable_segment(
+                source,
+                {source} if explicitly_preserved else (),
+                self.translator.terminology,
+            )
+            metadata = routing_metadata[index]
+            decision = None
+            if self.translator.name == "auto" and metadata is not None:
+                metadata = RoutingMetadata(
+                    preserve_eligible=not is_translatable,
+                    was_fragment_reconstructed=metadata.was_fragment_reconstructed,
+                    reconstruction_complexity=metadata.reconstruction_complexity,
+                    is_callout=metadata.is_callout,
+                    is_dense_table_text=metadata.is_dense_table_text,
+                    logical_unit_id=metadata.logical_unit_id,
+                    occurrence_id=metadata.occurrence_id,
+                    source_fragment_ids=metadata.source_fragment_ids,
+                )
+                routing_metadata[index] = metadata
+                decision = route_logical_unit(
+                    source,
+                    metadata,
+                    terminology=self.translator.terminology,
+                    requested_engine="auto",
+                )
+            if not is_translatable:
+                preserve_reasons[index] = approved_preserve_reason(
+                    source,
+                    explicitly_preserved=explicitly_preserved,
+                    terminology=self.translator.terminology,
+                )
+                outcomes[index] = (source, "preserved", None, ())
+                if decision is not None and metadata is not None:
+                    self.translator.record_preserve_route(
+                        metadata.logical_unit_id or str(index), decision, metadata
+                    )
                 continue
             key: tuple[str, object]
-            context = (
+            handoff_context = (
                 bounded_korean_context(sstk, pstk, index)
-                if self.translator.name == "handoff"
+                if self.translator.name in {"handoff", "auto"}
                 else None
             )
-            if should_share_translation(source, self.translator.name):
+            if self.translator.name == "auto":
+                key = ("logical-unit", metadata.logical_unit_id)
+                identity = metadata.logical_unit_id
+                context = {
+                    "routing_metadata": metadata,
+                    "routing_decision": decision,
+                    "handoff_context": handoff_context,
+                }
+            elif should_share_translation(source, self.translator.name):
                 key = ("shared", source)
                 identity = segment_identifier(encode_formula_placeholders(source))
+                context = handoff_context
             else:
                 key = ("occurrence", index)
                 identity = segment_identifier(
                     f"{encode_formula_placeholders(source)}\0"
                     f"page={ltpage.pageid}\0index={index}"
                 )
+                context = handoff_context
             if key not in jobs:
                 jobs[key] = (source, [], identity, context)
             jobs[key][1].append(index)
@@ -1624,9 +1861,70 @@ class TranslateConverter(PDFConverterEx):
         if any(outcome is None for outcome in outcomes):
             raise RuntimeError("translation scheduling lost an extracted segment")
         outcomes = [outcome for outcome in outcomes if outcome is not None]
-        news = [translated for translated, _status in outcomes]
+        news = [translated for translated, _status, _reason, _codes in outcomes]
         if len(outcomes) != len(sstk):
             raise RuntimeError("segment accounting lost an extracted segment")
+
+        for index, (target, outcome_status, unresolved_reason, failure_codes) in enumerate(
+            outcomes
+        ):
+            source_span_id = source_span_ids[index]
+            occurrence_id = occurrence_ids[index]
+            logical_unit_id = logical_unit_ids[index]
+            if source_span_id is None or occurrence_id is None:
+                continue
+            allowed_spans = approved_spans_for_translation(
+                sstk[index], self.translator.terminology
+            )
+            allowed_spans += tuple(
+                AllowedPreserveSpan(text, "technical_invariant", True)
+                for text in formula_texts_by_occurrence[index]
+                if text
+            )
+            preserve_reason = preserve_reasons[index]
+            if outcome_status == "translated":
+                status = OccurrenceStatus.TRANSLATED
+            elif outcome_status == "unresolved":
+                status = OccurrenceStatus.UNRESOLVED
+            else:
+                status = OccurrenceStatus.ALLOWED_PRESERVE
+                if preserve_reason in APPROVED_PRESERVE_REASONS:
+                    allowed_spans = (
+                        AllowedPreserveSpan(
+                            ledger_source_texts[index], preserve_reason, True
+                        ),
+                    )
+            occurrence = self.integrity_ledger.record_occurrence(
+                Occurrence(
+                    occurrence_id=occurrence_id,
+                    page=ltpage.pageid,
+                    source_span_ids=(source_span_id,),
+                    source_text=ledger_source_texts[index],
+                    logical_unit_id=logical_unit_id,
+                    status=status,
+                    target_text=materialize_formula_text(
+                        target,
+                        pstk[index].formula_ids,
+                        formula_texts_by_occurrence[index],
+                    ),
+                    preserve_reason=preserve_reason,
+                    preserve_reason_is_approved=(
+                        preserve_reason in APPROVED_PRESERVE_REASONS
+                    ),
+                    unresolved_reason=unresolved_reason,
+                    allowed_preserve_spans=allowed_spans,
+                    validation_failures=failure_codes,
+                )
+            )
+            if occurrence.status == OccurrenceStatus.UNRESOLVED:
+                reason = occurrence.unresolved_reason or "UnresolvedSegmentError"
+                self.record_translation_failure(
+                    sstk[index],
+                    reason,
+                    occurrence_id=occurrence_id,
+                    failure_codes=occurrence.validation_failures,
+                )
+                news[index] = sstk[index]
 
         ############################################################
         def raw_string(fcur: str, cstk: str):
@@ -2070,7 +2368,9 @@ class TranslateConverter(PDFConverterEx):
                     fitted_size = full_width_size
                 if fitted_size is None:
                     self.record_translation_failure(
-                        sstk[id], "table cell cannot fit at 50% font size"
+                        sstk[id],
+                        "table cell cannot fit at 50% font size",
+                        occurrence_id=occurrence_ids[id],
                     )
                     new = sstk[id]
                 else:
@@ -2141,7 +2441,9 @@ class TranslateConverter(PDFConverterEx):
                     # nowhere to fall back to, and reporting it as an
                     # untranslated segment twice would overstate the loss.
                     self.record_translation_failure(
-                        sstk[id], "single line needs less than 50% font size"
+                        sstk[id],
+                        "single line needs less than 50% font size",
+                        occurrence_id=occurrence_ids[id],
                     )
                     new = sstk[id]
                 else:

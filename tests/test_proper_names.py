@@ -340,7 +340,7 @@ class ProperNameCacheTests(unittest.TestCase):
         )
 
     def test_rule_revision_moves_old_bad_cache_out_of_namespace(self):
-        self.assertEqual(TRANSLATION_RULES_VERSION, "code4life-translation-v4")
+        self.assertEqual(TRANSLATION_RULES_VERSION, "code4life-translation-v5")
         with mock.patch.object(
             terminology, "TRANSLATION_RULES_VERSION", "code4life-translation-v3"
         ):

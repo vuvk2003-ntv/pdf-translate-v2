@@ -29,11 +29,12 @@ from pymupdf import Document, Font
 
 from pdf2zh.converter import TranslateConverter
 from pdf2zh.doclayout import OnnxModel
+from pdf2zh.integrity import Occurrence
 from pdf2zh.logical_units import ReconstructionMetrics
 from pdf2zh.pdfinterp import PDFPageInterpreterEx
 from pdf2zh.rules import (
-    anchored_translatable_lines,
     anchored_prose_bounds,
+    anchored_translatable_lines,
     classify_preserved_page,
     cluster_table_words,
     formula_regions,
@@ -137,6 +138,30 @@ class TranslationReport:
     translated_segments: int = 0
     preserved_segments: int = 0
     unresolved_segments: int = 0
+    eligible_source_spans: int = 0
+    ledger_assigned_source_spans: int = 0
+    unassigned_source_spans: int = 0
+    duplicate_source_span_assignments: int = 0
+    source_occurrences: int = 0
+    translated_occurrences: int = 0
+    allowed_preserve_occurrences: int = 0
+    unresolved_occurrences: int = 0
+    unknown_occurrences: int = 0
+    unapproved_preserve_failures: int = 0
+    hangul_leak_failures: int = 0
+    han_leak_failures: int = 0
+    technical_invariant_failures: int = 0
+    unchanged_prose_failures: int = 0
+    repeated_token_corruption_failures: int = 0
+    repeated_char_corruption_failures: int = 0
+    length_explosion_failures: int = 0
+    unexpected_script_failures: int = 0
+    cache_validation_failures: int = 0
+    final_output_script_leaks: int = 0
+    accounting_coverage: float = 1.0
+    translation_completion_rate: float = 1.0
+    delivery_status: str = "SUCCESS"
+    occurrences: tuple[Occurrence, ...] = ()
     unique_translation_units: int = 0
     raw_text_spans: int = 0
     candidate_fragments: int = 0
@@ -164,6 +189,29 @@ class TranslationReport:
     retry_units: int = 0
     handoff_table_hits: int = 0
     handoff_misses: int = 0
+    auto_units: int = 0
+    preserve_routed_units: int = 0
+    google_routed_units: int = 0
+    handoff_direct_units: int = 0
+    google_validation_failures: int = 0
+    google_to_handoff_escalations: int = 0
+    google_to_handoff_escalated_this_run: int = 0
+    pending_handoff_queue_after_run: int = 0
+    handoff_validation_failures: int = 0
+    handoff_unresolved_units: int = 0
+    google_cache_hits: int = 0
+    handoff_cache_hits: int = 0
+    google_provider_requests: int = 0
+    handoff_provider_batches_or_requests: int = 0
+    google_provider_unavailable_units: int = 0
+    handoff_provider_unavailable_units: int = 0
+    google_translation_seconds: float = 0.0
+    handoff_translation_seconds: float = 0.0
+    routing_seconds: float = 0.0
+    google_route_ratio: float = 0.0
+    handoff_direct_ratio: float = 0.0
+    escalation_ratio: float = 0.0
+    routing_traces: tuple[dict[str, Any], ...] = ()
     translation_seconds: float = 0.0
     prepare_seconds: float = 0.0
     layout_seconds: float = 0.0
@@ -416,8 +464,8 @@ def translate_patch(
     # layout_bounds because that one marks a table cell and changes how a
     # paragraph is fitted. This is only a measure to compare line ends against.
     class_bounds = {}
-    # Fresh class ids whose physical lines form one logical occurrence, even
-    # when the source PDF stores those lines in separate Form XObjects.
+    # Read-only Patch A provenance keyed by fresh layout class. Patch C consumes
+    # it without rerunning or changing reconstruction.
     logical_classes = {}
     reconstruction = ReconstructionMetrics()
     scanned_pages = set()
@@ -487,7 +535,7 @@ def translate_patch(
                 if page_layout.names[int(d.cls)] not in vcls
             ]
             page_class_bounds = class_bounds.setdefault(page.pageno, {})
-            page_logical_classes = logical_classes.setdefault(page.pageno, set())
+            page_logical_classes = logical_classes.setdefault(page.pageno, {})
             for i, d in reversed(non_vcls_boxes):
                 x0, y0, x1, y1 = d.xyxy.squeeze()
                 page_class_bounds[i + 2] = (
@@ -539,7 +587,7 @@ def translate_patch(
             next_class = len(page_layout.boxes) + 2
             page_bounds = layout_bounds.setdefault(page.pageno, {})
             page_cell_ids: dict[int, tuple[Any, ...]] = {}
-            page_logical_classes = logical_classes.setdefault(page.pageno, set())
+            page_logical_classes = logical_classes.setdefault(page.pageno, {})
             page_height = float(page_rect.height)
             page_words = upright_table_words(
                 source_page.get_text("words", sort=True),
@@ -706,8 +754,27 @@ def translate_patch(
                             page_bounds[next_class] = class_bound
                         elif class_bound is not None:
                             page_class_bounds[next_class] = class_bound
-                        if len(group.regions) > 1:
-                            page_logical_classes.add(next_class)
+                        page_logical_classes[next_class] = {
+                            "logical_unit_id": group.logical_unit_id,
+                            "source_fragment_ids": group.source_fragment_ids,
+                            "was_fragment_reconstructed": len(group.regions) > 1,
+                            "reconstruction_complexity": (
+                                "trivial_wrap"
+                                if group.merge_reasons
+                                and set(group.merge_reasons)
+                                <= {
+                                    "wrapped_line",
+                                    "same_line_continuation",
+                                    "inline_emphasis",
+                                    "same_cell_continuation",
+                                    "same_paragraph",
+                                }
+                                else "structural_merge"
+                                if group.merge_reasons
+                                else None
+                            ),
+                            "is_callout": group.callout_id is not None,
+                        }
                         next_class += 1
                 protected_parents = [
                     tuple(float(value) for value in detection.xyxy.squeeze())
@@ -788,8 +855,27 @@ def translate_patch(
                     )
                     box[py0:py1,px0:px1] = next_class
                 page_bounds[next_class] = (rx0, page_height-ry1, rx1, page_height-ry0)
-                if len(anchor.regions) > 1:
-                    page_logical_classes.add(next_class)
+                page_logical_classes[next_class] = {
+                    "logical_unit_id": anchor.logical_unit_id,
+                    "source_fragment_ids": anchor.source_fragment_ids,
+                    "was_fragment_reconstructed": len(anchor.regions) > 1,
+                    "reconstruction_complexity": (
+                        "trivial_wrap"
+                        if anchor.merge_reasons
+                        and set(anchor.merge_reasons)
+                        <= {
+                            "wrapped_line",
+                            "same_line_continuation",
+                            "inline_emphasis",
+                            "same_cell_continuation",
+                            "same_paragraph",
+                        }
+                        else "structural_merge"
+                        if anchor.merge_reasons
+                        else None
+                    ),
+                    "is_callout": anchor.callout_id is not None,
+                }
                 next_class += 1
 
             # Reapply exact metadata after carving translatable labels out
@@ -835,11 +921,29 @@ def translate_patch(
             )
 
     device.close()
-    unresolved_segments = len(device.translation_failures)
-    preserved_segments = device.extracted_segments - device.translatable_segments
-    translated_segments = device.translatable_segments - unresolved_segments
+    metrics = device.translator.metrics()
+    if device.translator.name == "auto":
+        routed = (
+            int(metrics.get("preserve_routed_units", 0))
+            + int(metrics.get("google_routed_units", 0))
+            + int(metrics.get("handoff_direct_units", 0))
+        )
+        if routed != int(metrics.get("auto_units", 0)):
+            raise RuntimeError("AUTO routing lost or duplicated a logical unit")
+        if (
+            int(metrics.get("pending_handoff_queue_after_run", 0))
+            > int(metrics.get("handoff_unresolved_units", 0))
+        ):
+            raise RuntimeError("pending Handoff units exceed unresolved Handoff units")
+    integrity = device.integrity_ledger.reconcile(
+        cache_validation_failures=int(metrics.get("cache_validation_failures", 0))
+    )
+    integrity.assert_reconciled()
+    unresolved_segments = integrity.unresolved_occurrences
+    preserved_segments = integrity.allowed_preserve_occurrences
+    translated_segments = integrity.translated_occurrences
     validate_segment_accounting(
-        device.extracted_segments,
+        integrity.source_occurrences,
         translated_segments,
         preserved_segments,
         unresolved_segments,
@@ -854,18 +958,45 @@ def translate_patch(
         0, device.extracted_segments - merged_unit_count
     )
     unit_char_counts = device.logical_unit_char_counts
+    auto_units = int(metrics.get("auto_units", 0))
+    google_routed_units = int(metrics.get("google_routed_units", 0))
 
-    metrics = device.translator.metrics()
     return obj_patch, TranslationReport(
         failures=device.translation_failures,
         reasons=device.failure_reasons,
         image_only_pages=device.image_only_pages,
         translatable_segments=device.translatable_segments,
         pages_processed=total_pages,
-        total_segments=device.extracted_segments,
+        total_segments=integrity.source_occurrences,
         translated_segments=translated_segments,
         preserved_segments=preserved_segments,
         unresolved_segments=unresolved_segments,
+        eligible_source_spans=integrity.eligible_source_spans,
+        ledger_assigned_source_spans=integrity.ledger_assigned_source_spans,
+        unassigned_source_spans=integrity.unassigned_source_spans,
+        duplicate_source_span_assignments=integrity.duplicate_source_span_assignments,
+        source_occurrences=integrity.source_occurrences,
+        translated_occurrences=integrity.translated_occurrences,
+        allowed_preserve_occurrences=integrity.allowed_preserve_occurrences,
+        unresolved_occurrences=integrity.unresolved_occurrences,
+        unknown_occurrences=integrity.unknown_occurrences,
+        unapproved_preserve_failures=integrity.unapproved_preserve_failures,
+        hangul_leak_failures=integrity.hangul_leak_failures,
+        han_leak_failures=integrity.han_leak_failures,
+        technical_invariant_failures=integrity.technical_invariant_failures,
+        unchanged_prose_failures=integrity.unchanged_prose_failures,
+        repeated_token_corruption_failures=(
+            integrity.repeated_token_corruption_failures
+        ),
+        repeated_char_corruption_failures=integrity.repeated_char_corruption_failures,
+        length_explosion_failures=integrity.length_explosion_failures,
+        unexpected_script_failures=integrity.unexpected_script_failures,
+        cache_validation_failures=integrity.cache_validation_failures,
+        final_output_script_leaks=integrity.final_output_script_leaks,
+        accounting_coverage=integrity.accounting_coverage,
+        translation_completion_rate=integrity.translation_completion_rate,
+        delivery_status=integrity.delivery_status,
+        occurrences=device.integrity_ledger.occurrences,
         unique_translation_units=device.unique_translation_units,
         raw_text_spans=reconstruction.raw_text_spans,
         candidate_fragments=reconstruction.candidate_fragments,
@@ -893,6 +1024,58 @@ def translate_patch(
         retry_units=device.retry_units,
         handoff_table_hits=int(metrics.get("handoff_table_hits", 0)),
         handoff_misses=int(metrics.get("handoff_misses", 0)),
+        auto_units=auto_units,
+        preserve_routed_units=int(metrics.get("preserve_routed_units", 0)),
+        google_routed_units=google_routed_units,
+        handoff_direct_units=int(metrics.get("handoff_direct_units", 0)),
+        google_validation_failures=int(
+            metrics.get("google_validation_failures", 0)
+        ),
+        google_to_handoff_escalations=int(
+            metrics.get("google_to_handoff_escalations", 0)
+        ),
+        google_to_handoff_escalated_this_run=int(
+            metrics.get("google_to_handoff_escalated_this_run", 0)
+        ),
+        pending_handoff_queue_after_run=int(
+            metrics.get("pending_handoff_queue_after_run", 0)
+        ),
+        handoff_validation_failures=int(
+            metrics.get("handoff_validation_failures", 0)
+        ),
+        handoff_unresolved_units=int(metrics.get("handoff_unresolved_units", 0)),
+        google_cache_hits=int(metrics.get("google_cache_hits", 0)),
+        handoff_cache_hits=int(metrics.get("handoff_cache_hits", 0)),
+        google_provider_requests=int(metrics.get("google_provider_requests", 0)),
+        handoff_provider_batches_or_requests=int(
+            metrics.get("handoff_provider_batches_or_requests", 0)
+        ),
+        google_provider_unavailable_units=int(
+            metrics.get("google_provider_unavailable_units", 0)
+        ),
+        handoff_provider_unavailable_units=int(
+            metrics.get("handoff_provider_unavailable_units", 0)
+        ),
+        google_translation_seconds=float(
+            metrics.get("google_translation_seconds", 0.0)
+        ),
+        handoff_translation_seconds=float(
+            metrics.get("handoff_translation_seconds", 0.0)
+        ),
+        routing_seconds=float(metrics.get("routing_seconds", 0.0)),
+        google_route_ratio=(google_routed_units / auto_units if auto_units else 0.0),
+        handoff_direct_ratio=(
+            int(metrics.get("handoff_direct_units", 0)) / auto_units
+            if auto_units
+            else 0.0
+        ),
+        escalation_ratio=(
+            int(metrics.get("google_to_handoff_escalations", 0))
+            / google_routed_units
+            if google_routed_units
+            else 0.0
+        ),
+        routing_traces=getattr(device.translator, "routing_traces", ()),
         translation_seconds=float(metrics.get("translation_seconds", 0.0)),
         used_output_font_names=tuple(sorted(device.used_output_font_names)),
     )
