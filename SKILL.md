@@ -35,11 +35,12 @@ reads/processes the PDF locally; when the user forbids PDF processing, use only
 the synthetic string/JSONL fixtures and mark real-document gates `NOT_RUN`.
 
 The bundled worker uses D2 typed retry limits: one local evaluation for the
-Google source-length guard, two attempts for post-provider quality rejection,
+Google source-length guard, eight attempts for post-provider quality rejection,
 and eight for transport/unknown errors. Safe shared Google failures can reuse
 the first unresolved reason within one document. Read the D2 section in the
-profiling reference for eligibility and acceptance limits; a two-attempt cap
-does not prove that a later provider attempt could never succeed.
+profiling reference for eligibility and acceptance limits. The first-occurrence
+retry budget matches legacy behavior; cache suppression of later occurrences
+still has a separately demonstrated outcome-equivalence risk.
 
 | Mode | Translator | Use when |
 | --- | --- | --- |

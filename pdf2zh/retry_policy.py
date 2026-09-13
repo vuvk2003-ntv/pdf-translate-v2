@@ -8,9 +8,9 @@ from pdf2zh.invariants import TechnicalInvariantError, VerifiedProperNameError
 from pdf2zh.terminology import TerminologyConsistencyError
 from pdf2zh.translator import FormulaPlaceholderError, SegmentTooLongError
 
-CONTENT_QUALITY_MAX_ATTEMPTS = 2
 PRE_PROVIDER_MAX_ATTEMPTS = 1
 TRANSPORT_MAX_ATTEMPTS = 8
+CONTENT_QUALITY_MAX_ATTEMPTS = TRANSPORT_MAX_ATTEMPTS
 
 # The only current SegmentTooLongError raise site is Google.do_translate's
 # payload-length guard, before session.get. No post-provider variant exists.

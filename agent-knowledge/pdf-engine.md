@@ -10,12 +10,14 @@ stops before provider calls and final native output. It still processes PDFs.
 See [performance profiling](../references/performance-profiling.md) for report
 definitions, benchmark isolation and acceptance limits.
 
-D2 worker retries use typed 1/2/8 local/quality/transport budgets. A converter
+D2 worker retries use typed 1/8/8 local/quality/transport budgets. A converter
 created fresh per `translate_patch` owns the locked negative-cache mapping for
 safe shared Google provider failures only. Cache hits use ordinary unresolved
 occurrence accounting. Fit, geometry, occurrence/context-sensitive, Handoff and
 AUTO jobs do not enter that mapping. The D2 section in the profiling reference
-records the exact scope and the demonstrated limit on outcome equivalence.
+records the exact scope, passing first-occurrence recovery probe and failing
+later-repeat negative-cache equivalence probe. Full real-document equivalence
+remains NOT_ESTABLISHED.
 
 1. `scripts/translate_pdf.py` validates a text-based PDF and stages output.
 2. `pdf2zh/high_level.py` loads fonts/model, predicts layout, matches tables,

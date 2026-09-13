@@ -1111,6 +1111,7 @@ class TranslateConverter(PDFConverterEx):
         # One converter is constructed per translate_patch document run.
         self.known_unsafe_identities: dict[str, str] = {}
         self._known_unsafe_lock = threading.Lock()
+        self._disable_negative_cache_for_tests: bool = False
         # Segments the translator was actually asked for. Zero across a whole
         # document means there was no text to translate, not that translation
         # failed - the difference between "run OCR first" and "try again".
@@ -1229,7 +1230,8 @@ class TranslateConverter(PDFConverterEx):
             and context is None and not is_context_sensitive_korean(s)
         )
         reason = None
-        if negative_cache_eligible and not self.profile.plan_only:
+        if (negative_cache_eligible and not self.profile.plan_only
+                and not self._disable_negative_cache_for_tests):
             with self._known_unsafe_lock:
                 reason = self.known_unsafe_identities.get(identity)
         if reason is not None:

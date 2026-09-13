@@ -20,7 +20,11 @@ from pdf2zh.integrity import (
     audit_final_text_layer,
 )
 from pdf2zh.performance import PerformanceProfile
-from pdf2zh.retry_policy import _estimated_content_retry_backoff_seconds
+from pdf2zh.retry_policy import (
+    CONTENT_QUALITY_MAX_ATTEMPTS,
+    TRANSPORT_MAX_ATTEMPTS,
+    _estimated_content_retry_backoff_seconds,
+)
 from pdf2zh.translator import encode_formula_placeholders, segment_identifier
 from scripts.benchmark_patch_d2_synthetic import (
     FAILED_SOURCE,
@@ -28,6 +32,7 @@ from scripts.benchmark_patch_d2_synthetic import (
     LONG_SOURCE,
     TARGETS,
     Clock,
+    run_negative_cache_repeat_recovery_probe,
 )
 from scripts.benchmark_patch_d_synthetic import MemoryCache
 
@@ -78,14 +83,15 @@ class D2WorkerTests(unittest.TestCase):
     def count(self, key, converter=None):
         return (converter or self.converter).profile.snapshot()["workload"].get(key,0)
 
-    def test_01_deterministic_quality_two_calls_one_sleep_unresolved(self):
+    def test_01_deterministic_quality_full_eight_calls_legacy_waits_unresolved(self):
         get = self.mock_output(TARGETS[FAILED_SOURCE])
         result = self.run_job()
-        self.assertEqual(get.call_count,2)
-        self.assertEqual(self.sleeps,[1])
+        self.assertEqual(get.call_count,8)
+        self.assertEqual(self.sleeps,[1,2,4,8,16,32,60])
         self.assertEqual(result[1:3],("unresolved","TechnicalInvariantError"))
-        self.assertEqual(self.count("content_quality_retry_attempts_capped"),1)
-        self.assertEqual(self.count("retry_requests"),1)
+        self.assertEqual(self.count("content_quality_retry_attempts_capped"),0)
+        self.assertEqual(self.count("retry_requests"),7)
+        self.assertEqual(CONTENT_QUALITY_MAX_ATTEMPTS,TRANSPORT_MAX_ATTEMPTS)
 
     def test_02_shared_page_b_has_no_request_or_sleep(self):
         get = self.mock_output(TARGETS[FAILED_SOURCE])
@@ -93,10 +99,10 @@ class D2WorkerTests(unittest.TestCase):
         sleeps = list(self.sleeps)
         second = self.run_job()
         self.assertEqual(first[:3],second[:3])
-        self.assertEqual(get.call_count,2)
+        self.assertEqual(get.call_count,8)
         self.assertEqual(self.sleeps,sleeps)
         self.assertEqual(self.count("negative_cache_skips"),1)
-        self.assertEqual(self.count("negative_cache_estimated_retry_backoff_seconds_saved"),1.0)
+        self.assertEqual(self.count("negative_cache_estimated_retry_backoff_seconds_saved"),123.0)
 
     def test_03_transport_recovers_on_third_call(self):
         response = self.mock_output(TARGETS[GOOD_SOURCE]).return_value
@@ -122,15 +128,15 @@ class D2WorkerTests(unittest.TestCase):
         get = self.mock_output(TARGETS[FAILED_SOURCE])
         for index in range(2):
             self.run_job(key=("occurrence",index),identity=f"occ-{index}")
-        self.assertEqual(get.call_count,4)
-        self.assertEqual(self.sleeps,[1,1])
+        self.assertEqual(get.call_count,16)
+        self.assertEqual(self.sleeps,[1,2,4,8,16,32,60] * 2)
         self.assertFalse(self.converter.known_unsafe_identities)
 
     def test_04b_context_bearing_shared_key_never_cached(self):
         get = self.mock_output(TARGETS[FAILED_SOURCE])
         for _ in range(2):
             self.run_job(context={"type":"untrusted_context","kind":"adjacent_segment","text":"context"})
-        self.assertEqual(get.call_count,4)
+        self.assertEqual(get.call_count,16)
         self.assertFalse(self.converter.known_unsafe_identities)
 
     def test_05_fresh_converter_starts_empty_and_pays_own_ladder(self):
@@ -141,8 +147,8 @@ class D2WorkerTests(unittest.TestCase):
         self.assertFalse(second.known_unsafe_identities)
         get = self.mock_output(TARGETS[FAILED_SOURCE], second)
         self.run_job(converter=second)
-        self.assertEqual(get.call_count,2)
-        self.assertEqual(second_sleeps,[1])
+        self.assertEqual(get.call_count,8)
+        self.assertEqual(second_sleeps,[1,2,4,8,16,32,60])
         self.assertEqual(self.count("negative_cache_skips",second),0)
 
     def test_06_first_reason_preserved(self):
@@ -305,6 +311,26 @@ class D2WorkerTests(unittest.TestCase):
         self.assertEqual(result[1:3], ("unresolved", "TechnicalInvariantError"))
         self.assertEqual(get.call_count, 8)
         self.assertEqual(self.count("content_quality_retry_attempts_capped"), 0)
+
+    def test_20_repeat_recovery_probe_isolates_negative_cache_read(self):
+        probe = run_negative_cache_repeat_recovery_probe()
+        self.assertEqual(probe["d2_provider_call_count"], 8)
+        self.assertEqual(probe["d2_negative_cache_skips"], 1)
+        self.assertEqual(probe["d2_status"], "UNRESOLVED")
+        self.assertEqual(probe["control_provider_call_count"], 9)
+        self.assertEqual(probe["control_negative_cache_skips"], 0)
+        self.assertEqual(probe["control_status"], "TRANSLATED")
+        self.assertFalse(probe["identity_sets_equal"])
+        self.assertEqual(probe["NEGATIVE_CACHE_REPEAT_RECOVERY_PROBE"], "FAIL")
+        self.assertEqual(probe["OFFLINE_NEGATIVE_CACHE_EQUIVALENCE"], "FAIL")
+        self.assertEqual(probe["CRITERION_16b"], "NOT_ESTABLISHED")
+        for path in ("d2", "control"):
+            self.assertTrue(probe[path]["cache_written_after_first_occurrence"])
+            self.assertEqual(probe[path]["first_provider_call_count"], 8)
+            self.assertFalse(probe[path]["plan_only"])
+            self.assertEqual(probe[path]["accounting"]["accounting_coverage"], 1.0)
+            self.assertEqual(probe[path]["accounting"]["duplicate_source_span_assignments"], 0)
+            self.assertEqual(probe[path]["accounting"]["unassigned_source_spans"], 0)
 
 
 if __name__ == "__main__":

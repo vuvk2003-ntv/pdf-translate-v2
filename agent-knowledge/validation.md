@@ -10,12 +10,16 @@ do not run discovery or `--profile-only`. Mark real-document acceptance gates
 performance/layout acceptance.
 
 For D2 without PDF processing, run `scripts/run_patch_d2_no_pdf_checks.py`:
-375 explicitly selected tests, including 22 D2 fixtures, with PDF/HTTP guards.
+376 explicitly selected tests, including 23 D2 fixtures, with PDF/HTTP guards.
 Use `scripts/benchmark_patch_d2_synthetic.py` for exact controlled before/after
-identity-set and accounting comparison. `--quality-recovery-probe` demonstrates
-the outcome drift possible when a quality rejection recovers after attempt 2.
-Report that finding separately from passing fixed-response fixtures. Real
-benchmark/layout gates remain `NOT_RUN`; do not infer ship-ready acceptance.
+identity-set and accounting comparison. `--quality-recovery-probe` now verifies
+that the restored eight-attempt budget reaches first-occurrence recovery at
+attempt 3. `--negative-cache-repeat-recovery-probe` compares the same D2 worker
+with cache reads active versus only the test read toggle disabled: calls 1–8
+fail, call 9 succeeds. Expected counterexample reproduction passes the fixture
+but reports OFFLINE_NEGATIVE_CACHE_EQUIVALENCE=FAIL. Criterion 16a passes the
+first-occurrence probe; 16b remains NOT_ESTABLISHED until a real-PDF comparison.
+Real benchmark/layout gates remain `NOT_RUN`; do not infer ship-ready acceptance.
 
 Run from the repository root with the platform virtual environment:
 

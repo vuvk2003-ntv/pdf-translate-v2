@@ -165,6 +165,95 @@ def run_workload(*, legacy=False, quality_recovers=False):
                                         translation_seconds=translator_metrics["translation_seconds"])}
 
 
+def run_negative_cache_repeat_recovery_probe():
+    """Isolate later-call suppression using the same worker and a read-only toggle."""
+    def run_path(disable_read):
+        clock = Clock()
+        profile = PerformanceProfile(enabled=True, clock=clock, cache_mode="cold-isolated")
+        sleep = profile.sleep
+        profile.sleep = lambda seconds: sleep(seconds, sleeper=clock.advance)
+        converter = TranslateConverter(PDFResourceManager(), service="google", lang_in="en",
+                                       lang_out="vi", thread=4, envs={"performance_profile": profile})
+        assert converter._disable_negative_cache_for_tests is False
+        converter._disable_negative_cache_for_tests = disable_read
+        provider_calls = 0
+
+        def fake_get(_endpoint, **_kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            target = TARGETS[FAILED_SOURCE] if provider_calls <= 8 else "Đặt D100 thành 10 và D200 thành 20."
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                                   text='<div class="result-container">' + html.escape(target) + '</div>')
+
+        converter.translator.session.get = fake_get
+        identity = segment_identifier(encode_formula_placeholders(FAILED_SOURCE))
+        request = converter._make_translation_request()
+        first = converter._translate_job(FAILED_SOURCE, identity, None, ("shared", FAILED_SOURCE), request)
+        first_provider_calls = provider_calls
+        cache_written = identity in converter.known_unsafe_identities
+        second = converter._translate_job(FAILED_SOURCE, identity, None, ("shared", FAILED_SOURCE), request)
+        outcomes = []
+        for page, result in enumerate((first, second)):
+            target, status, reason, codes = result
+            span_id = f"repeat-span-{page}"
+            occurrence_id = f"repeat-occ-{page}"
+            converter.integrity_ledger.add_eligible_span(EligibleSourceSpan(
+                source_span_id=span_id, page=page, source_text=FAILED_SOURCE, logical_unit_id=identity))
+            converter.integrity_ledger.record_occurrence(Occurrence(
+                occurrence_id=occurrence_id, page=page, source_span_ids=(span_id,), source_text=FAILED_SOURCE,
+                logical_unit_id=identity, status=OccurrenceStatus.UNRESOLVED if status == "unresolved"
+                else OccurrenceStatus.TRANSLATED, target_text=target, unresolved_reason=reason,
+                validation_failures=codes))
+            outcomes.append({"occurrence_id": occurrence_id, "identity": identity,
+                             "status": status, "reason": reason})
+        metrics = converter.integrity_ledger.reconcile()
+        skips = profile.snapshot()["workload"].get("negative_cache_skips", 0)
+        return {
+            "negative_cache_read_disabled": disable_read, "plan_only": profile.plan_only,
+            "provider_call_count": provider_calls, "negative_cache_skips": skips,
+            "first_provider_call_count": first_provider_calls,
+            "cache_written_after_first_occurrence": cache_written,
+            "first_status": first[1].upper(), "status": second[1].upper(),
+            "outcomes": outcomes,
+            "identity_sets": {bucket: sorted({row["identity"] for row in outcomes if row["status"] == bucket})
+                              for bucket in ("translated", "preserved", "unresolved")},
+            "accounting": {"accounting_coverage": metrics.accounting_coverage,
+                           "duplicate_source_span_assignments": metrics.duplicate_source_span_assignments,
+                           "unassigned_source_spans": metrics.unassigned_source_spans,
+                           "translated_occurrences": metrics.translated_occurrences,
+                           "unresolved_occurrences": metrics.unresolved_occurrences},
+        }
+
+    with (
+        patch("pdf2zh.translator.TranslationCache", MemoryCache),
+        patch("pymupdf.open", side_effect=AssertionError("PDF processing forbidden")),
+        patch("requests.sessions.Session.request", side_effect=AssertionError("live HTTP forbidden")),
+    ):
+        d2 = run_path(False)
+        control = run_path(True)
+    equal = d2["identity_sets"] == control["identity_sets"]
+    assert d2["provider_call_count"] == 8 and d2["negative_cache_skips"] == 1
+    assert d2["status"] == "UNRESOLVED"
+    assert control["provider_call_count"] == 9 and control["negative_cache_skips"] == 0
+    assert control["status"] == "TRANSLATED"
+    assert not equal
+    for path in (d2, control):
+        assert path["first_provider_call_count"] == 8 and path["cache_written_after_first_occurrence"]
+        assert path["first_status"] == "UNRESOLVED" and not path["plan_only"]
+    return {
+        "real_pdf": False, "live_provider": False,
+        "control_note": "Same D2 worker; only negative-cache READ disabled; writes active; plan_only false",
+        "d2": d2, "control": control,
+        "d2_provider_call_count": d2["provider_call_count"],
+        "d2_negative_cache_skips": d2["negative_cache_skips"], "d2_status": d2["status"],
+        "control_provider_call_count": control["provider_call_count"],
+        "control_negative_cache_skips": control["negative_cache_skips"], "control_status": control["status"],
+        "identity_sets_equal": equal,
+        "NEGATIVE_CACHE_REPEAT_RECOVERY_PROBE": "FAIL",
+        "OFFLINE_NEGATIVE_CACHE_EQUIVALENCE": "FAIL", "CRITERION_16b": "NOT_ESTABLISHED",
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -172,7 +261,9 @@ def main():
     parser.add_argument("--compare-before", type=Path, help="Compare exact outcomes/sets/accounting to saved baseline")
     parser.add_argument("--comparison-output", type=Path)
     parser.add_argument("--quality-recovery-probe", action="store_true",
-                        help="Offline counterexample: quality fails twice, then succeeds")
+                        help="First-occurrence probe: quality fails twice, then succeeds")
+    parser.add_argument("--negative-cache-repeat-recovery-probe", action="store_true",
+                        help="Offline repeat probe comparing active cache to read-disabled control")
     args = parser.parse_args()
     if bool(args.compare_before) != bool(args.comparison_output):
         parser.error("--compare-before and --comparison-output must be supplied together")
@@ -184,13 +275,26 @@ def main():
     if args.quality_recovery_probe:
         before = run_workload(legacy=True, quality_recovers=True)
         after = run_workload(quality_recovers=True)
+        equal = before["identity_sets"] == after["identity_sets"]
+        attempts_baseline = before["provider_calls_by_source"][FAILED_SOURCE]
+        attempts_d2 = after["provider_calls_by_source"][FAILED_SOURCE]
+        first_status_baseline = before["outcomes"][0]["status"]
+        first_status_d2 = after["outcomes"][0]["status"]
+        passed = (equal and attempts_baseline == 3 and attempts_d2 == 3
+                  and first_status_baseline == "translated" and first_status_d2 == "translated")
         result["quality_recovery_probe"] = {
             "real_pdf": False, "live_provider": False,
             "behavior": "For the same source, provider outputs fail quality twice and succeed on call 3",
             "before": before, "after": after,
-            "identity_sets_equal": before["identity_sets"] == after["identity_sets"],
-            "finding": "UNIVERSAL_OUTCOME_EQUIVALENCE_COUNTEREXAMPLE",
+            "attempts_baseline": attempts_baseline, "attempts_d2": attempts_d2,
+            "first_status_baseline": first_status_baseline, "first_status_d2": first_status_d2,
+            "identity_sets_equal": equal,
+            "QUALITY_RECOVERY_PROBE": "PASS" if passed else "FAIL",
+            "CRITERION_16a": "PASS" if passed else "FAIL",
+            "finding": "FIRST_OCCURRENCE_RECOVERY_REACHED" if passed else "FIRST_OCCURRENCE_RECOVERY_FAILED",
         }
+    if args.negative_cache_repeat_recovery_probe:
+        result["negative_cache_repeat_recovery_probe"] = run_negative_cache_repeat_recovery_probe()
     args.output.parent.mkdir(parents=True,exist_ok=True)
     args.output.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding="utf-8")
     comparison_ok = True
@@ -215,7 +319,8 @@ def main():
         args.comparison_output.write_text(json.dumps(comparison,ensure_ascii=False,indent=2)+'\n',encoding="utf-8")
     print(json.dumps({key:result["result"][key] for key in
                       ("policy","synthetic_total_seconds","provider_calls","accounting")},ensure_ascii=True))
-    return 0 if comparison_ok else 1
+    recovery_ok = result.get("quality_recovery_probe", {}).get("QUALITY_RECOVERY_PROBE", "PASS") == "PASS"
+    return 0 if comparison_ok and recovery_ok else 1
 
 
 if __name__ == "__main__":
