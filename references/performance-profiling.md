@@ -1,7 +1,7 @@
-# Performance profiling (Patch D and D2)
+# Performance profiling (Patch D, D2 and D3)
 
 Contents: execution modes; timer definitions; workload/cache/batches; benchmark
-workflow; acceptance and stopping conditions; D2 retry/cache policy.
+workflow; acceptance and stopping conditions; D2 retry and D3 cache recovery.
 
 ## Execution modes
 
@@ -136,7 +136,7 @@ none above the threshold; use `PATCH_D_PROVIDER_LATENCY_DOMINATED` only with
 measured external dominance. Otherwise use `PATCH_D_FAIL` and specify missing
 gates. Synthetic timing correctness alone cannot satisfy the real-PDF gates.
 
-## D2 typed retry and document negative cache
+## D2 typed retry and D3 document negative-cache recovery
 
 `pdf2zh/retry_policy.py` defines the worker's Tenacity stop policy. The only
 current `SegmentTooLongError` raise is Google's length check before HTTP:
@@ -151,11 +151,20 @@ The follow-up supersedes the original two-attempt quality budget, restoring
 first-occurrence recovery opportunities throughout the legacy eight attempts.
 
 One fresh `TranslateConverter` is created in each document's `translate_patch`
-call. Its `known_unsafe_identities` mapping and lock exist only for that run.
+call. Its `known_unsafe_identities`, pending `identity_failure_strikes` and lock
+exist only for that run. D3 ships `RECOVERY_WINDOW=2`.
 Only an existing safe `("shared", source)` Google provider job without
 context-sensitive Korean or attached context can write the mapping, after
-terminal post-provider quality rejection. Store the first nonempty exception
-class reason with atomic `setdefault`. Read the reason atomically and return
+terminal post-provider quality rejection exhausting the unchanged full ladder.
+The first qualifying occurrence creates strike 1 and does not establish trust;
+the second creates strike 2, promotes the first window reason with `setdefault`
+and clears pending state. Already trusted identities never re-enter pending
+state. A genuine validated provider success before trust resets pending
+strikes. Per-thread provider activity prevents a validated positive-cache hit
+or another worker's request from resetting strikes. Local preferred, preserve,
+transport and fit/render outcomes do not reset them. Trusted entries remain a
+one-way document latch, even if test-bypass provider success later occurs.
+Read the trusted reason atomically and return
 the ordinary unresolved result; the normal occurrence consumer records it
 once and the existing final script audit remains mandatory.
 
@@ -178,10 +187,10 @@ For a no-PDF D2 check, run:
 
 ```text
 <python> <skill-root>/scripts/run_patch_d2_no_pdf_checks.py
-<python> <skill-root>/scripts/benchmark_patch_d2_synthetic.py --output <separate-after.json> --compare-before <skill-root>/docs/patch-d2-synthetic-before.json --comparison-output <separate-comparison.json> --quality-recovery-probe --negative-cache-repeat-recovery-probe
+<python> <skill-root>/scripts/benchmark_patch_d2_synthetic.py --output <separate-after.json> --compare-before <skill-root>/docs/patch-d2-synthetic-before.json --comparison-output <separate-comparison.json> --quality-recovery-probe --negative-cache-repeat-recovery-probe --two-strike-trust-probe
 ```
 
-The runner selects 376 string/JSONL/ledger/geometry checks and guards PDF opening
+The runner selects 388 string/JSONL/ledger/geometry checks and guards PDF opening
 and live HTTP. The benchmark uses fixed fake Google responses, an injected
 clock and an isolated memory cache. Its comparison proves exact identity sets,
 occurrence outcomes and coverage only for that controlled workload.
@@ -194,14 +203,24 @@ False and it is not exposed as a CLI setting. It bypasses only the cache READ;
 writes and all provider/validation/accounting paths remain active. Do not use
 plan-only mode as an equivalence control.
 
-**D2 full acceptance is not established.** After eight failed quality calls,
-the active negative cache skips the repeat and remains unresolved (8 calls,
-1 skip). The read-disabled control reaches call 9, succeeds and is translated
-(9 calls, 0 skips). The probe reproduces unequal identity sets and reports
-`NEGATIVE_CACHE_REPEAT_RECOVERY_PROBE=FAIL` and
-`OFFLINE_NEGATIVE_CACHE_EQUIVALENCE=FAIL`. Part 2 remains enabled and unchanged.
-Criterion 16b stays `NOT_ESTABLISHED` regardless of any synthetic result until
-the same real PDF is compared with Part 2 enabled/disabled. That comparison and
-real timing/layout gates are `NOT_RUN`; do not claim `PATCH_D2_PASS`, ship-ready
-status or a PDF speedup. See the
-[implementation evidence, fixtures, comparison and 17 acceptance gates](../docs/PATCH_D2_RETRY_NEGATIVE_CACHE.md).
+The known D2 one-strike counterexample is **FIXED**: the repeat-recovery probe
+now makes 9 calls on both D3/control paths, skips zero jobs, translates the
+second occurrence and clears pending strikes with equal identity sets. The
+two-strike trust probe defines calls 1–24 as quality failures: D3 makes 16 calls
+then skips occurrence 3, control makes 24 calls; both remain unresolved and
+have equal sets. Report these results as `PASS ON TESTED PROBE`.
+
+For the stipulated fully failing repeat shape (one identity ×5, another ×2),
+theoretical attempts are 56 without cache, 16 with historical D2 one-strike
+trust and 32 with D3 two-strike trust. D3 retains 24/40=60% of the theoretical
+provider-attempt saving. Three skipped ladders can avoid at most 369 nominal
+retry-backoff seconds in this shape; none of these are measured PDF savings.
+
+**General Criterion 16b stays NOT_ESTABLISHED.** A finite two-occurrence window
+cannot prove a provider never recovers after trust. Fixture 8 deliberately
+shows a forced later success retaining the trusted latch. Real-corpus outcome,
+performance and layout comparisons are `NOT_RUN`; do not claim general
+equivalence or a PDF speedup. See the current [D3 implementation, both exact
+probe comparisons and 21 acceptance gates](../docs/PATCH_D3_RECOVERY_WINDOW.md).
+The [D2 follow-up report](../docs/PATCH_D2_RETRY_NEGATIVE_CACHE.md) and its JSON
+remain historical evidence.

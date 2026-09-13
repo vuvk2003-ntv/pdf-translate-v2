@@ -149,7 +149,7 @@ def run_workload(*, legacy=False, quality_recovers=False):
                           "unresolved_occurrences":metrics.unresolved_occurrences,
                           "google_provider_requests":translator_metrics["translation_requests"],
                           "google_cache_hits":translator_metrics["cache_hits"]})
-    return {"policy":"D2" if d2 else "legacy8", "synthetic_total_seconds":clock.value,
+    return {"policy":"D3" if d2 else "legacy8", "synthetic_total_seconds":clock.value,
             "local_test_elapsed_seconds":real_elapsed, "provider_calls":sum(requests_by_source.values()),
             "provider_calls_by_source":requests_by_source, "retry_sleep_schedule":sleeps,
             "outcomes":outcomes,
@@ -165,7 +165,7 @@ def run_workload(*, legacy=False, quality_recovers=False):
                                         translation_seconds=translator_metrics["translation_seconds"])}
 
 
-def run_negative_cache_repeat_recovery_probe():
+def run_negative_cache_repeat_recovery_probe(*, two_strike_trust=False):
     """Isolate later-call suppression using the same worker and a read-only toggle."""
     def run_path(disable_read):
         clock = Clock()
@@ -181,7 +181,9 @@ def run_negative_cache_repeat_recovery_probe():
         def fake_get(_endpoint, **_kwargs):
             nonlocal provider_calls
             provider_calls += 1
-            target = TARGETS[FAILED_SOURCE] if provider_calls <= 8 else "Đặt D100 thành 10 và D200 thành 20."
+            failing_calls = 24 if two_strike_trust else 8
+            target = (TARGETS[FAILED_SOURCE] if provider_calls <= failing_calls
+                      else "Đặt D100 thành 10 và D200 thành 20.")
             return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
                                    text='<div class="result-container">' + html.escape(target) + '</div>')
 
@@ -191,9 +193,14 @@ def run_negative_cache_repeat_recovery_probe():
         first = converter._translate_job(FAILED_SOURCE, identity, None, ("shared", FAILED_SOURCE), request)
         first_provider_calls = provider_calls
         cache_written = identity in converter.known_unsafe_identities
+        pending_after_first = dict(converter.identity_failure_strikes)
         second = converter._translate_job(FAILED_SOURCE, identity, None, ("shared", FAILED_SOURCE), request)
+        trusted_after_second = dict(converter.known_unsafe_identities)
+        results = [first, second]
+        if two_strike_trust:
+            results.append(converter._translate_job(FAILED_SOURCE, identity, None, ("shared", FAILED_SOURCE), request))
         outcomes = []
-        for page, result in enumerate((first, second)):
+        for page, result in enumerate(results):
             target, status, reason, codes = result
             span_id = f"repeat-span-{page}"
             occurrence_id = f"repeat-occ-{page}"
@@ -213,7 +220,11 @@ def run_negative_cache_repeat_recovery_probe():
             "provider_call_count": provider_calls, "negative_cache_skips": skips,
             "first_provider_call_count": first_provider_calls,
             "cache_written_after_first_occurrence": cache_written,
-            "first_status": first[1].upper(), "status": second[1].upper(),
+            "pending_after_first_occurrence": pending_after_first,
+            "pending_after_last_occurrence": dict(converter.identity_failure_strikes),
+            "trusted_after_second_occurrence": trusted_after_second,
+            "trusted_after_last_occurrence": dict(converter.known_unsafe_identities),
+            "first_status": first[1].upper(), "status": results[-1][1].upper(),
             "outcomes": outcomes,
             "identity_sets": {bucket: sorted({row["identity"] for row in outcomes if row["status"] == bucket})
                               for bucket in ("translated", "preserved", "unresolved")},
@@ -232,26 +243,44 @@ def run_negative_cache_repeat_recovery_probe():
         d2 = run_path(False)
         control = run_path(True)
     equal = d2["identity_sets"] == control["identity_sets"]
-    assert d2["provider_call_count"] == 8 and d2["negative_cache_skips"] == 1
-    assert d2["status"] == "UNRESOLVED"
-    assert control["provider_call_count"] == 9 and control["negative_cache_skips"] == 0
-    assert control["status"] == "TRANSLATED"
-    assert not equal
+    if two_strike_trust:
+        assert d2["provider_call_count"] == 16 and d2["negative_cache_skips"] == 1
+        assert control["provider_call_count"] == 24 and control["negative_cache_skips"] == 0
+        assert d2["status"] == control["status"] == "UNRESOLVED"
+        assert d2["trusted_after_second_occurrence"] and control["trusted_after_second_occurrence"]
+    else:
+        assert d2["provider_call_count"] == control["provider_call_count"] == 9
+        assert d2["negative_cache_skips"] == control["negative_cache_skips"] == 0
+        assert d2["status"] == control["status"] == "TRANSLATED"
+        assert not d2["trusted_after_last_occurrence"] and not control["trusted_after_last_occurrence"]
+    assert equal
+    identity = segment_identifier(encode_formula_placeholders(FAILED_SOURCE))
     for path in (d2, control):
-        assert path["first_provider_call_count"] == 8 and path["cache_written_after_first_occurrence"]
+        assert path["first_provider_call_count"] == 8 and not path["cache_written_after_first_occurrence"]
+        assert path["pending_after_first_occurrence"] == {identity: (1, "TechnicalInvariantError")}
+        assert not path["pending_after_last_occurrence"]
         assert path["first_status"] == "UNRESOLVED" and not path["plan_only"]
     return {
         "real_pdf": False, "live_provider": False,
-        "control_note": "Same D2 worker; only negative-cache READ disabled; writes active; plan_only false",
+        "control_note": "Same D3 worker; only negative-cache READ disabled; writes active; plan_only false",
         "d2": d2, "control": control,
         "d2_provider_call_count": d2["provider_call_count"],
         "d2_negative_cache_skips": d2["negative_cache_skips"], "d2_status": d2["status"],
         "control_provider_call_count": control["provider_call_count"],
         "control_negative_cache_skips": control["negative_cache_skips"], "control_status": control["status"],
         "identity_sets_equal": equal,
-        "NEGATIVE_CACHE_REPEAT_RECOVERY_PROBE": "FAIL",
-        "OFFLINE_NEGATIVE_CACHE_EQUIVALENCE": "FAIL", "CRITERION_16b": "NOT_ESTABLISHED",
+        "NEGATIVE_CACHE_REPEAT_RECOVERY_PROBE": "PASS ON TESTED PROBE",
+        "OFFLINE_NEGATIVE_CACHE_EQUIVALENCE": "PASS ON TESTED PROBE", "CRITERION_16b": "NOT_ESTABLISHED",
+        "calls_avoided_on_third_occurrence": control["provider_call_count"] - d2["provider_call_count"]
+        if two_strike_trust else 0,
     }
+
+
+def run_two_strike_trust_probe():
+    result = run_negative_cache_repeat_recovery_probe(two_strike_trust=True)
+    result["TWO_STRIKE_TRUST_PROBE"] = "PASS ON TESTED PROBE"
+    result.pop("NEGATIVE_CACHE_REPEAT_RECOVERY_PROBE")
+    return result
 
 
 def main():
@@ -264,6 +293,8 @@ def main():
                         help="First-occurrence probe: quality fails twice, then succeeds")
     parser.add_argument("--negative-cache-repeat-recovery-probe", action="store_true",
                         help="Offline repeat probe comparing active cache to read-disabled control")
+    parser.add_argument("--two-strike-trust-probe", action="store_true",
+                        help="Two failed occurrences establish trust; third control ladder also fails")
     args = parser.parse_args()
     if bool(args.compare_before) != bool(args.comparison_output):
         parser.error("--compare-before and --comparison-output must be supplied together")
@@ -295,6 +326,8 @@ def main():
         }
     if args.negative_cache_repeat_recovery_probe:
         result["negative_cache_repeat_recovery_probe"] = run_negative_cache_repeat_recovery_probe()
+    if args.two_strike_trust_probe:
+        result["two_strike_trust_probe"] = run_two_strike_trust_probe()
     args.output.parent.mkdir(parents=True,exist_ok=True)
     args.output.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding="utf-8")
     comparison_ok = True

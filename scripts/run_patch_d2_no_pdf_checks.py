@@ -12,6 +12,7 @@ if str(SKILL_ROOT) not in sys.path:
     sys.path.insert(0, str(SKILL_ROOT))
 
 SUITES = (
+    "tests.test_patch_d3_recovery",
     "tests.test_patch_d2_retry",
     "tests.test_patch_d_performance",
     "tests.test_logical_units",

@@ -1,5 +1,10 @@
 # Patch D2 follow-up: restored quality retry budget and residual cache risk
 
+**Historical D2 follow-up report.** Superseded for current cache trust behavior
+by [Patch D3 recovery-window report](PATCH_D3_RECOVERY_WINDOW.md). The D2 probe
+results below and their JSON are retained as historical evidence. Current D3
+fixes that one-strike probe; general Criterion 16b remains NOT_ESTABLISHED.
+
 Current implementation: 2026-09-13, following the user's pasted
 `Patch D2 follow-up — de-risk CONTENT_QUALITY_MAX_ATTEMPTS` request.
 This document supersedes the earlier D2 v2 acceptance report. The original

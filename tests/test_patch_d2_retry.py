@@ -83,6 +83,9 @@ class D2WorkerTests(unittest.TestCase):
     def count(self, key, converter=None):
         return (converter or self.converter).profile.snapshot()["workload"].get(key,0)
 
+    def remember_strike(self, identity, reason):
+        self.converter._remember_unsafe_identity_strike(identity, type(reason, (Exception,), {})())
+
     def test_01_deterministic_quality_full_eight_calls_legacy_waits_unresolved(self):
         get = self.mock_output(TARGETS[FAILED_SOURCE])
         result = self.run_job()
@@ -96,10 +99,12 @@ class D2WorkerTests(unittest.TestCase):
     def test_02_shared_page_b_has_no_request_or_sleep(self):
         get = self.mock_output(TARGETS[FAILED_SOURCE])
         first = self.run_job()
+        second_evaluated = self.run_job()
         sleeps = list(self.sleeps)
         second = self.run_job()
         self.assertEqual(first[:3],second[:3])
-        self.assertEqual(get.call_count,8)
+        self.assertEqual(first[:3],second_evaluated[:3])
+        self.assertEqual(get.call_count,16)
         self.assertEqual(self.sleeps,sleeps)
         self.assertEqual(self.count("negative_cache_skips"),1)
         self.assertEqual(self.count("negative_cache_estimated_retry_backoff_seconds_saved"),123.0)
@@ -142,9 +147,11 @@ class D2WorkerTests(unittest.TestCase):
     def test_05_fresh_converter_starts_empty_and_pays_own_ladder(self):
         self.mock_output(TARGETS[FAILED_SOURCE])
         self.run_job()
-        self.assertTrue(self.converter.known_unsafe_identities)
+        self.assertTrue(self.converter.identity_failure_strikes)
+        self.assertFalse(self.converter.known_unsafe_identities)
         second, _, second_sleeps = self.make_converter()
         self.assertFalse(second.known_unsafe_identities)
+        self.assertFalse(second.identity_failure_strikes)
         get = self.mock_output(TARGETS[FAILED_SOURCE], second)
         self.run_job(converter=second)
         self.assertEqual(get.call_count,8)
@@ -153,15 +160,16 @@ class D2WorkerTests(unittest.TestCase):
 
     def test_06_first_reason_preserved(self):
         identity = segment_identifier(FAILED_SOURCE)
-        self.converter._remember_unsafe_identity(identity,"First provider reason")
-        self.converter._remember_unsafe_identity(identity,"Later provider reason")
+        self.remember_strike(identity,"First provider reason")
+        self.remember_strike(identity,"Later provider reason")
         get = self.mock_output(TARGETS[FAILED_SOURCE])
         self.assertEqual(self.run_job()[2],"First provider reason")
         get.assert_not_called()
 
     def test_07_concurrent_committed_cache_hits_do_not_call_provider(self):
         identity = segment_identifier(FAILED_SOURCE)
-        self.converter._remember_unsafe_identity(identity,"First reason")
+        self.remember_strike(identity,"First reason")
+        self.remember_strike(identity,"First reason")
         get = self.mock_output(TARGETS[FAILED_SOURCE])
         with ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(lambda _: self.run_job(),range(20)))
@@ -173,12 +181,13 @@ class D2WorkerTests(unittest.TestCase):
         barrier = threading.Barrier(4)
         def write(index):
             barrier.wait(timeout=5)
-            self.converter._remember_unsafe_identity("id",str(index))
+            self.remember_strike("id",str(index))
         with ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(write,range(4)))
         first = self.converter.known_unsafe_identities["id"]
-        self.converter._remember_unsafe_identity("id","replacement")
+        self.remember_strike("id","replacement")
         self.assertEqual(self.converter.known_unsafe_identities,{"id":first})
+        self.assertFalse(self.converter.identity_failure_strikes)
 
     def record_result(self, page, source, result):
         target,status,reason,codes = result
@@ -209,20 +218,21 @@ class D2WorkerTests(unittest.TestCase):
         source = "통신 매개변수 설정을 확인하십시오."
         self.mock_output(source)  # Real Patch B rejects unexpected Korean in vi output.
         first = self.run_job(source)
+        evaluated_repeat = self.run_job(source)
         second = self.run_job(source)
         self.assertEqual(first[1:3],second[1:3])
-        for page,result in enumerate((first,second)):
+        for page,result in enumerate((first,evaluated_repeat,second)):
             self.record_result(page,source,result)
         metrics = self.converter.integrity_ledger.reconcile()
         self.assertEqual(metrics.accounting_coverage,1.0)
-        self.assertEqual(metrics.unresolved_occurrences,2)
+        self.assertEqual(metrics.unresolved_occurrences,3)
         self.assertEqual(metrics.duplicate_source_span_assignments,0)
         self.assertEqual(metrics.unassigned_source_spans,0)
         self.assertEqual(self.count("negative_cache_skips"),1)
-        audit = audit_final_text_layer({0:source,1:source},self.converter.integrity_ledger.occurrences,
+        audit = audit_final_text_layer({0:source,1:source,2:source},self.converter.integrity_ledger.occurrences,
                                       source_language="ko",target_language="vi")
         self.assertEqual(audit.final_output_script_leaks,0)
-        unexpected = audit_final_text_layer({0:source,1:source+"가"},self.converter.integrity_ledger.occurrences,
+        unexpected = audit_final_text_layer({0:source,1:source,2:source+"가"},self.converter.integrity_ledger.occurrences,
                                            source_language="ko",target_language="vi")
         self.assertEqual(unexpected.final_output_script_leaks,1)
 
@@ -246,6 +256,7 @@ class D2WorkerTests(unittest.TestCase):
                     result = self.run_job()
                 self.assertEqual(result[1:3],("unresolved","TechnicalInvariantError"))
                 self.assertFalse(self.converter.known_unsafe_identities)
+                self.assertFalse(self.converter.identity_failure_strikes)
         self.assertEqual(self.count("negative_cache_invalid_reason_rejected"),3)
 
     def test_12_preferred_validation_error_not_negative_cached(self):
@@ -295,7 +306,8 @@ class D2WorkerTests(unittest.TestCase):
 
     def test_18_plan_only_ignores_negative_cache(self):
         identity = segment_identifier(FAILED_SOURCE)
-        self.converter._remember_unsafe_identity(identity, "First reason")
+        self.remember_strike(identity, "First reason")
+        self.remember_strike(identity, "First reason")
         self.converter.profile.plan_only = True
         get = self.mock_output(TARGETS[FAILED_SOURCE])
         result = self.run_job()
@@ -314,18 +326,21 @@ class D2WorkerTests(unittest.TestCase):
 
     def test_20_repeat_recovery_probe_isolates_negative_cache_read(self):
         probe = run_negative_cache_repeat_recovery_probe()
-        self.assertEqual(probe["d2_provider_call_count"], 8)
-        self.assertEqual(probe["d2_negative_cache_skips"], 1)
-        self.assertEqual(probe["d2_status"], "UNRESOLVED")
+        self.assertEqual(probe["d2_provider_call_count"], 9)
+        self.assertEqual(probe["d2_negative_cache_skips"], 0)
+        self.assertEqual(probe["d2_status"], "TRANSLATED")
         self.assertEqual(probe["control_provider_call_count"], 9)
         self.assertEqual(probe["control_negative_cache_skips"], 0)
         self.assertEqual(probe["control_status"], "TRANSLATED")
-        self.assertFalse(probe["identity_sets_equal"])
-        self.assertEqual(probe["NEGATIVE_CACHE_REPEAT_RECOVERY_PROBE"], "FAIL")
-        self.assertEqual(probe["OFFLINE_NEGATIVE_CACHE_EQUIVALENCE"], "FAIL")
+        self.assertTrue(probe["identity_sets_equal"])
+        self.assertEqual(probe["NEGATIVE_CACHE_REPEAT_RECOVERY_PROBE"], "PASS ON TESTED PROBE")
+        self.assertEqual(probe["OFFLINE_NEGATIVE_CACHE_EQUIVALENCE"], "PASS ON TESTED PROBE")
         self.assertEqual(probe["CRITERION_16b"], "NOT_ESTABLISHED")
         for path in ("d2", "control"):
-            self.assertTrue(probe[path]["cache_written_after_first_occurrence"])
+            self.assertFalse(probe[path]["cache_written_after_first_occurrence"])
+            self.assertTrue(probe[path]["pending_after_first_occurrence"])
+            self.assertFalse(probe[path]["pending_after_last_occurrence"])
+            self.assertFalse(probe[path]["trusted_after_last_occurrence"])
             self.assertEqual(probe[path]["first_provider_call_count"], 8)
             self.assertFalse(probe[path]["plan_only"])
             self.assertEqual(probe[path]["accounting"]["accounting_coverage"], 1.0)

@@ -8,6 +8,7 @@ import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from enum import Enum, IntEnum
+from functools import wraps
 from string import Template
 from typing import Dict
 
@@ -70,6 +71,7 @@ from pdf2zh.translator import (
 )
 
 log = logging.getLogger(__name__)
+RECOVERY_WINDOW = 2
 STYLE_TAG_PATTERN = re.compile(r"<(/?)s([123])>", re.IGNORECASE)
 PLACEHOLDER_ONLY_PATTERN = re.compile(r"\{v\d+\}")
 IDENTITY_ORIENTATION = (1.0, 0.0, 0.0, 1.0)
@@ -1110,6 +1112,7 @@ class TranslateConverter(PDFConverterEx):
         self._failure_lock = threading.Lock()
         # One converter is constructed per translate_patch document run.
         self.known_unsafe_identities: dict[str, str] = {}
+        self.identity_failure_strikes: dict[str, tuple[int, str]] = {}
         self._known_unsafe_lock = threading.Lock()
         self._disable_negative_cache_for_tests: bool = False
         # Segments the translator was actually asked for. Zero across a whole
@@ -1156,6 +1159,20 @@ class TranslateConverter(PDFConverterEx):
             ignore_cache=ignore_cache,
         )
 
+        # Track only this worker thread's real provider evaluations. A validated
+        # positive-cache hit is not a new provider success for strike reset.
+        self._negative_cache_provider_activity = threading.local()
+        if self.translator.name == "google":
+            provider_translate = self.translator.do_translate
+
+            @wraps(provider_translate)
+            def observe_provider_translation(*args, **kwargs):
+                activity = self._negative_cache_provider_activity
+                activity.calls = getattr(activity, "calls", 0) + 1
+                return provider_translate(*args, **kwargs)
+
+            self.translator.do_translate = observe_provider_translation
+
     def _make_translation_request(self, record_retry: Callable | None = None) -> Callable:
         def stop_by_failure_class(retry_state) -> bool:
             stopped = _stop_by_failure_class(retry_state)
@@ -1181,13 +1198,29 @@ class TranslateConverter(PDFConverterEx):
 
         return request_translation
 
-    def _remember_unsafe_identity(self, identity: str, reason: str | None) -> None:
+    def _remember_unsafe_identity_strike(self, identity: str, error: BaseException) -> None:
+        reason = _reason_from_exception(error)
         if not isinstance(reason, str) or not reason.strip():
             log.warning("Not caching content failure with an empty unresolved reason")
             self.profile.count("negative_cache_invalid_reason_rejected")
             return
         with self._known_unsafe_lock:
-            self.known_unsafe_identities.setdefault(identity, reason)
+            if identity in self.known_unsafe_identities:
+                return
+            reason = reason.strip()
+            count, first_reason = self.identity_failure_strikes.get(identity, (0, reason))
+            if count == 0:
+                first_reason = reason
+            count += 1
+            self.identity_failure_strikes[identity] = (count, first_reason)
+            if count >= RECOVERY_WINDOW:
+                self.known_unsafe_identities.setdefault(identity, first_reason)
+                self.identity_failure_strikes.pop(identity, None)
+
+    def _reset_pending_identity_strikes(self, identity: str) -> None:
+        with self._known_unsafe_lock:
+            if identity not in self.known_unsafe_identities:
+                self.identity_failure_strikes.pop(identity, None)
 
     def _translate_segment(
         self, s: str, identity: str, context: dict[str, object] | None,
@@ -1203,6 +1236,7 @@ class TranslateConverter(PDFConverterEx):
                     self.translator.record_local_translation(identity, decision, metadata)
             return preferred, True
         encoded = encode_formula_placeholders(s)
+        provider_calls_before = getattr(self._negative_cache_provider_activity, "calls", 0)
         try:
             translated = request_translation(encoded, identity, context)
         except PRE_PROVIDER_DETERMINISTIC_ERRORS:
@@ -1212,12 +1246,14 @@ class TranslateConverter(PDFConverterEx):
             # Only terminal exceptions from Tenacity reach this branch. Local
             # preferred-result validation and later formula restore/fit do not.
             if negative_cache_eligible:
-                self._remember_unsafe_identity(identity, _reason_from_exception(error))
+                self._remember_unsafe_identity_strike(identity, error)
             raise
-        return (
-            restore_formula_placeholders(s, translated),
-            self.translator.has_translation_for_identity(encoded, identity),
-        )
+        restored = restore_formula_placeholders(s, translated)
+        resolved = self.translator.has_translation_for_identity(encoded, identity)
+        if (negative_cache_eligible and resolved
+                and getattr(self._negative_cache_provider_activity, "calls", 0) > provider_calls_before):
+            self._reset_pending_identity_strikes(identity)
+        return restored, resolved
 
     def _translate_job(
         self, s: str, identity: str, context: dict[str, object] | None,

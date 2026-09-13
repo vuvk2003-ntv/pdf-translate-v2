@@ -36,11 +36,13 @@ the synthetic string/JSONL fixtures and mark real-document gates `NOT_RUN`.
 
 The bundled worker uses D2 typed retry limits: one local evaluation for the
 Google source-length guard, eight attempts for post-provider quality rejection,
-and eight for transport/unknown errors. Safe shared Google failures can reuse
-the first unresolved reason within one document. Read the D2 section in the
-profiling reference for eligibility and acceptance limits. The first-occurrence
-retry budget matches legacy behavior; cache suppression of later occurrences
-still has a separately demonstrated outcome-equivalence risk.
+and eight for transport/unknown errors. D3 trusts a safe shared Google failure
+only after two qualifying exhausted occurrences within the document. A genuine
+validated provider success before trust clears pending strikes; later trusted
+occurrences may reuse the first failure-window reason. Read the D2/D3 section
+in the profiling reference for eligibility and acceptance limits. First retry
+behavior matches legacy; a finite recovery window does not prove general
+outcome equivalence after trust is established.
 
 | Mode | Translator | Use when |
 | --- | --- | --- |

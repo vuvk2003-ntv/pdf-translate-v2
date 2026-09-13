@@ -12,12 +12,16 @@ definitions, benchmark isolation and acceptance limits.
 
 D2 worker retries use typed 1/8/8 local/quality/transport budgets. A converter
 created fresh per `translate_patch` owns the locked negative-cache mapping for
-safe shared Google provider failures only. Cache hits use ordinary unresolved
-occurrence accounting. Fit, geometry, occurrence/context-sensitive, Handoff and
-AUTO jobs do not enter that mapping. The D2 section in the profiling reference
-records the exact scope, passing first-occurrence recovery probe and failing
-later-repeat negative-cache equivalence probe. Full real-document equivalence
-remains NOT_ESTABLISHED.
+safe shared Google provider failures only. D3 RECOVERY_WINDOW=2 retains pending
+failure strikes until two full-ladder failures promote the first window reason
+and remove pending state. A genuine validated provider success before promotion
+resets pending strikes; validated positive-cache hits and local preferred paths
+do not. Trusted entries remain latched even after test-bypass provider success.
+Cache hits use ordinary unresolved occurrence accounting. Fit, geometry,
+occurrence/context-sensitive, Handoff and AUTO jobs remain excluded. The D2/D3
+section in the profiling reference records the fixed one-strike counterexample
+and passing defined two-strike probe. General full equivalence remains
+NOT_ESTABLISHED.
 
 1. `scripts/translate_pdf.py` validates a text-based PDF and stages output.
 2. `pdf2zh/high_level.py` loads fonts/model, predicts layout, matches tables,

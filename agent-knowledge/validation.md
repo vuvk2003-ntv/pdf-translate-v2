@@ -9,16 +9,22 @@ do not run discovery or `--profile-only`. Mark real-document acceptance gates
 `NOT_RUN`. Profiling correctness and synthetic overhead are separate from PDF
 performance/layout acceptance.
 
-For D2 without PDF processing, run `scripts/run_patch_d2_no_pdf_checks.py`:
-376 explicitly selected tests, including 23 D2 fixtures, with PDF/HTTP guards.
+For D2/D3 without PDF processing, run `scripts/run_patch_d2_no_pdf_checks.py`:
+388 explicitly selected tests, including 23 D2 and 12 D3 tests, with PDF/HTTP guards.
 Use `scripts/benchmark_patch_d2_synthetic.py` for exact controlled before/after
 identity-set and accounting comparison. `--quality-recovery-probe` now verifies
 that the restored eight-attempt budget reaches first-occurrence recovery at
 attempt 3. `--negative-cache-repeat-recovery-probe` compares the same D2 worker
 with cache reads active versus only the test read toggle disabled: calls 1–8
-fail, call 9 succeeds. Expected counterexample reproduction passes the fixture
-but reports OFFLINE_NEGATIVE_CACHE_EQUIVALENCE=FAIL. Criterion 16a passes the
-first-occurrence probe; 16b remains NOT_ESTABLISHED until a real-PDF comparison.
+fail, call 9 succeeds. D3 now returns translated at call 9 on both paths and
+clears pending strikes: known one-strike counterexample FIXED.
+`--two-strike-trust-probe` defines failures for calls 1–24: D3 makes 16 calls,
+skips occurrence 3; control makes 24 calls, both remain unresolved with equal
+identity sets. These are PASS ON TESTED PROBE. Verify promotion removes pending
+state, genuine success resets only pending state, and trusted entries remain
+latched after bypass success. Fixture 5 audits 20 concurrent calls in test-only
+state, as approved by the user; production pending state is cleared at promotion.
+Criterion 16a passes; general 16b remains NOT_ESTABLISHED.
 Real benchmark/layout gates remain `NOT_RUN`; do not infer ship-ready acceptance.
 
 Run from the repository root with the platform virtual environment:
